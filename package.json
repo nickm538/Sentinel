@@ -1,7 +1,7 @@
 {
   "name": "sentinel-trap-v4",
   "version": "4.0.0",
-  "scripts": { "start": "node server/index.js" },
+  "scripts": { "start": "node server-index.js" },
   "dependencies": {
     "express": "^4.19.2",
     "pg": "^8.13.0",
