@@ -80,12 +80,12 @@ function adminAuth(req, res, next) {
   const expected = process.env.ADMIN_PASS;
   if (!expected) {
     res.set('Cache-Control', 'no-store');
-    return res.status(503).type('text/plain').send(
-      'Admin portal disabled. Set the ADMIN_PASS environment variable to enable it.'
-    );
+    return res.status(503).type('text/plain').send('Service unavailable');
   }
   const header = req.headers.authorization || '';
-  const [scheme, token] = header.split(' ');
+  const sep = header.indexOf(' ');
+  const scheme = sep === -1 ? '' : header.slice(0, sep);
+  const token = sep === -1 ? '' : header.slice(sep + 1);
   if (scheme === 'Basic' && token) {
     let decoded = '';
     try { decoded = Buffer.from(token, 'base64').toString('utf8'); } catch (e) {}
@@ -101,12 +101,16 @@ function adminAuth(req, res, next) {
   res.status(401).type('text/plain').send('Authentication required');
 }
 
+// Light per-IP rate limit applied to admin-gated routes so a stolen or
+// brute-forced credential can't be used to flood the DB or emit events.
+const adminLimiter = rateLimit({ windowMs: 60_000, max: 120 });
+
 // ROBUST BAIT GENERATOR (root — your daily tool)
 // After the red button is pressed, the same page transforms into the admin
 // portal: live results feed and historical clicks. The page is gated behind
 // admin Basic Auth because it triggers trap creation and renders sensitive
 // click data.
-app.get('/', adminAuth, (req, res) => {
+app.get('/', adminLimiter, adminAuth, (req, res) => {
   res.send(`
 <!DOCTYPE html>
 <html>
@@ -299,7 +303,7 @@ app.get('/', adminAuth, (req, res) => {
 
 // Historical clicks feed for the admin portal on `/`. Gated behind admin
 // auth because the payloads contain IPs, fingerprints, and enrichment.
-app.get('/api/clicks', adminAuth, async (req, res) => {
+app.get('/api/clicks', adminLimiter, adminAuth, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT trap_id, data, created_at FROM clicks ORDER BY created_at DESC LIMIT 100'
@@ -311,7 +315,7 @@ app.get('/api/clicks', adminAuth, async (req, res) => {
 });
 
 // CREATE TRAP — admin-only; anyone able to create traps can flood the DB.
-app.post('/api/create-trap', adminAuth, async (req, res) => {
+app.post('/api/create-trap', adminLimiter, adminAuth, async (req, res) => {
   const id = crypto.randomBytes(6).toString('hex');
   await pool.query('INSERT INTO traps (id) VALUES ($1)', [id]);
   res.json({ link: `/check-scammer/${id}` });
@@ -390,7 +394,7 @@ app.get('/check-scammer/:id', (req, res) => {
 });
 
 // ROBUST DASHBOARD (full live view of all great information)
-app.get('/dashboard', adminAuth, (req, res) => {
+app.get('/dashboard', adminLimiter, adminAuth, (req, res) => {
   res.send(`
 <!DOCTYPE html>
 <html>
@@ -451,7 +455,9 @@ function getClientIp(req) {
 }
 
 async function trapExists(trapId) {
-  if (typeof trapId !== 'string' || !/^[a-zA-Z0-9]{1,64}$/.test(trapId)) return false;
+  // Accept both legacy lowercase-alphanumeric IDs (8 chars from the old
+  // Math.random generator) and current hex IDs (12 chars from randomBytes).
+  if (typeof trapId !== 'string' || !/^[a-z0-9]{6,32}$/.test(trapId)) return false;
   try {
     const r = await pool.query('SELECT 1 FROM traps WHERE id = $1', [trapId]);
     return r.rowCount > 0;
@@ -484,62 +490,66 @@ app.post('/api/track', trackLimiter, async (req, res) => {
   res.json({ ok: true });
 
   setImmediate(async () => {
-    let ipinfo = null, abuse = null, aiProfile = null;
-
-    if (process.env.IPINFO_TOKEN && clientIp) {
-      try {
-        const r = await axios.get(
-          `https://ipinfo.io/${encodeURIComponent(clientIp)}`,
-          { params: { token: process.env.IPINFO_TOKEN }, timeout: 5000 }
-        );
-        ipinfo = r.data;
-      } catch (e) { console.error('ipinfo failed:', e.message); }
-    }
-
-    if (process.env.ABUSEIPDB_KEY && clientIp) {
-      try {
-        const r = await axios.get('https://api.abuseipdb.com/api/v2/check', {
-          params: { ipAddress: clientIp, maxAgeInDays: 90 },
-          headers: { Key: process.env.ABUSEIPDB_KEY, Accept: 'application/json' },
-          timeout: 5000
-        });
-        abuse = r.data && r.data.data;
-      } catch (e) { console.error('abuseipdb failed:', e.message); }
-    }
-
-    if (process.env.OPENROUTER_KEY) {
-      try {
-        const summary = {
-          ip: clientIp, ua: body.ua, ipinfo, abuse,
-          timezone: body.timezone, languages: body.languages, screen: body.screen
-        };
-        const r = await axios.post(
-          'https://openrouter.ai/api/v1/chat/completions',
-          {
-            model: process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini',
-            messages: [{
-              role: 'user',
-              content: 'In 2-3 sentences, profile this likely-scammer click based on the data. Be concise.\n\n' + JSON.stringify(summary)
-            }]
-          },
-          {
-            headers: { Authorization: `Bearer ${process.env.OPENROUTER_KEY}` },
-            timeout: 10000
-          }
-        );
-        aiProfile = r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content;
-      } catch (e) { console.error('openrouter failed:', e.message); }
-    }
-
-    // Strip client-supplied ip so it can't override the server-derived value.
-    const { ip: _ignored, ...safeBody } = body;
-    const enriched = Object.assign({}, safeBody, { ip: clientIp, ipinfo, abuse, aiProfile });
-
     try {
-      await pool.query('INSERT INTO clicks (trap_id, data) VALUES ($1, $2)', [trapId, enriched]);
-    } catch (e) { console.error('clicks insert failed:', e.message); }
+      let ipinfo = null, abuse = null, aiProfile = null;
 
-    io.emit('live-click', enriched);
+      if (process.env.IPINFO_TOKEN && clientIp) {
+        try {
+          const r = await axios.get(
+            `https://ipinfo.io/${encodeURIComponent(clientIp)}`,
+            { params: { token: process.env.IPINFO_TOKEN }, timeout: 5000 }
+          );
+          ipinfo = r.data;
+        } catch (e) { console.error('ipinfo failed:', e.message); }
+      }
+
+      if (process.env.ABUSEIPDB_KEY && clientIp) {
+        try {
+          const r = await axios.get('https://api.abuseipdb.com/api/v2/check', {
+            params: { ipAddress: clientIp, maxAgeInDays: 90 },
+            headers: { Key: process.env.ABUSEIPDB_KEY, Accept: 'application/json' },
+            timeout: 5000
+          });
+          abuse = r.data && r.data.data;
+        } catch (e) { console.error('abuseipdb failed:', e.message); }
+      }
+
+      if (process.env.OPENROUTER_KEY) {
+        try {
+          const summary = {
+            ip: clientIp, ua: body.ua, ipinfo, abuse,
+            timezone: body.timezone, languages: body.languages, screen: body.screen
+          };
+          const r = await axios.post(
+            'https://openrouter.ai/api/v1/chat/completions',
+            {
+              model: process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini',
+              messages: [{
+                role: 'user',
+                content: 'In 2-3 sentences, profile this likely-scammer click based on the data. Be concise.\n\n' + JSON.stringify(summary)
+              }]
+            },
+            {
+              headers: { Authorization: `Bearer ${process.env.OPENROUTER_KEY}` },
+              timeout: 10000
+            }
+          );
+          aiProfile = r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content;
+        } catch (e) { console.error('openrouter failed:', e.message); }
+      }
+
+      // Strip client-supplied ip so it can't override the server-derived value.
+      const { ip: _ignored, ...safeBody } = body;
+      const enriched = Object.assign({}, safeBody, { ip: clientIp, ipinfo, abuse, aiProfile });
+
+      try {
+        await pool.query('INSERT INTO clicks (trap_id, data) VALUES ($1, $2)', [trapId, enriched]);
+      } catch (e) { console.error('clicks insert failed:', e.message); }
+
+      io.emit('live-click', enriched);
+    } catch (e) {
+      console.error('track background processing failed:', e);
+    }
   });
 });
 
@@ -576,7 +586,7 @@ app.post('/api/live', liveLimiter, async (req, res) => {
 
 // Historical research-mode events for the admin portal. Gated behind admin
 // auth because the payloads include precise geolocation.
-app.get('/api/live-events', adminAuth, async (req, res) => {
+app.get('/api/live-events', adminLimiter, adminAuth, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT data, created_at FROM live_events ORDER BY created_at DESC LIMIT 100'
