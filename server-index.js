@@ -599,4 +599,24 @@ app.get('/api/live-events', adminLimiter, adminAuth, async (req, res) => {
 
 io.on('connection', () => {});
 
+// Startup configuration check. Logs which expected env vars are missing so
+// misconfigurations on the host (e.g. Railway) are obvious in the deploy logs.
+// Never logs the values themselves.
+(function reportEnvConfig() {
+  const required = ['ADMIN_PASS', 'DATABASE_URL', 'ALLOWED_ORIGINS'];
+  const optional = ['ABUSEIPDB_KEY', 'IPINFO_TOKEN', 'OPENROUTER_KEY', 'OPENROUTER_MODEL'];
+  const missingRequired = required.filter(k => !process.env[k]);
+  const missingOptional = optional.filter(k => !process.env[k]);
+  if (missingRequired.length) {
+    console.warn(`⚠️  Missing required env vars: ${missingRequired.join(', ')}`);
+  }
+  if (missingOptional.length) {
+    console.log(`ℹ️  Optional env vars not set (related features disabled): ${missingOptional.join(', ')}`);
+  }
+  const enabled = optional.filter(k => process.env[k]);
+  if (enabled.length) {
+    console.log(`✅ Optional integrations enabled: ${enabled.join(', ')}`);
+  }
+})();
+
 server.listen(process.env.PORT || 3000, () => console.log('🚀 Sentinel Trap v4 FULLY LIVE — robust frontend deployed'));
