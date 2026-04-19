@@ -523,7 +523,8 @@ app.post('/api/track', trackLimiter, async (req, res) => {
           const r = await axios.post(
             'https://openrouter.ai/api/v1/chat/completions',
             {
-              model: process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini',
+              model: process.env.OPENROUTER_MODEL || 'openai/gpt-5-2025-08-07',
+              reasoning_effort: 'high',
               messages: [{
                 role: 'user',
                 content: 'In 2-3 sentences, profile this likely-scammer click based on the data. Be concise.\n\n' + JSON.stringify(summary)
