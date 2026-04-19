@@ -4,10 +4,22 @@ const http = require('http');
 const { Server } = require('socket.io');
 const axios = require('axios');
 const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
+
+// Trust the reverse proxy (Heroku/Render/etc.) so `req.ip` reflects the real
+// client IP from the first hop of `x-forwarded-for` instead of the proxy's IP.
+app.set('trust proxy', true);
+
+// Restrict CORS and socket.io to explicitly configured origins. If nothing is
+// configured, cross-origin requests are rejected rather than silently allowed.
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const corsOrigin = allowedOrigins.length ? allowedOrigins : false;
+
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, { cors: { origin: corsOrigin } });
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
@@ -33,14 +45,68 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
   console.log('✅ Database tables ready');
 })();
 
-app.use(express.json());
-app.use(cors());
+app.use(express.json({ limit: '256kb' }));
+app.use(cors({ origin: corsOrigin }));
+
+// Simple in-memory rate limiter keyed by client IP. Expired buckets are
+// pruned opportunistically on each hit so memory stays bounded.
+function rateLimit({ windowMs, max }) {
+  const hits = new Map();
+  return (req, res, next) => {
+    const key = req.ip || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    if (hits.size > 10_000) {
+      for (const [k, v] of hits) {
+        if (now - v.start > windowMs) hits.delete(k);
+      }
+    }
+    let entry = hits.get(key);
+    if (!entry || now - entry.start > windowMs) {
+      entry = { start: now, count: 0 };
+      hits.set(key, entry);
+    }
+    entry.count++;
+    if (entry.count > max) {
+      return res.status(429).json({ error: 'rate limit exceeded' });
+    }
+    next();
+  };
+}
+
+// HTTP Basic Auth guard for the admin portal and the endpoints that return
+// sensitive data (IPs, fingerprints, geolocation). Fails closed when
+// `ADMIN_PASS` is unset so the portal cannot be exposed by accident.
+function adminAuth(req, res, next) {
+  const expected = process.env.ADMIN_PASS;
+  if (!expected) {
+    res.set('Cache-Control', 'no-store');
+    return res.status(503).type('text/plain').send(
+      'Admin portal disabled. Set the ADMIN_PASS environment variable to enable it.'
+    );
+  }
+  const header = req.headers.authorization || '';
+  const [scheme, token] = header.split(' ');
+  if (scheme === 'Basic' && token) {
+    let decoded = '';
+    try { decoded = Buffer.from(token, 'base64').toString('utf8'); } catch (e) {}
+    const idx = decoded.indexOf(':');
+    const provided = idx >= 0 ? decoded.slice(idx + 1) : decoded;
+    const a = Buffer.from(provided);
+    const b = Buffer.from(expected);
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+      return next();
+    }
+  }
+  res.set('WWW-Authenticate', 'Basic realm="Sentinel Admin", charset="UTF-8"');
+  res.status(401).type('text/plain').send('Authentication required');
+}
 
 // ROBUST BAIT GENERATOR (root — your daily tool)
 // After the red button is pressed, the same page transforms into the admin
-// portal: live results feed, historical clicks, and the secret research-mode
-// password field (the "deep session" toggle).
-app.get('/', (req, res) => {
+// portal: live results feed and historical clicks. The page is gated behind
+// admin Basic Auth because it triggers trap creation and renders sensitive
+// click data.
+app.get('/', adminAuth, (req, res) => {
   res.send(`
 <!DOCTYPE html>
 <html>
@@ -66,8 +132,6 @@ app.get('/', (req, res) => {
       <div class="flex flex-col md:flex-row md:justify-between md:items-center gap-4 border-t border-zinc-800 pt-6">
         <h2 class="text-2xl font-bold text-lime-400">Admin Portal — Live Results</h2>
         <div class="flex items-center gap-2">
-          <input id="researchPass" type="password" placeholder="research password" class="bg-zinc-900 px-4 py-3 rounded-xl border border-zinc-800">
-          <button onclick="toggleResearch()" class="px-4 py-3 bg-amber-600 hover:bg-amber-700 rounded-xl">🔬 Research Preview</button>
           <button onclick="generateBait()" class="px-4 py-3 bg-red-600 hover:bg-red-700 rounded-xl">+ New bait link</button>
         </div>
       </div>
@@ -228,33 +292,14 @@ app.get('/', (req, res) => {
         </div>
       \`;
     }
-
-    async function toggleResearch() {
-      const pass = document.getElementById('researchPass').value;
-      try {
-        const r = await fetch('/api/research-auth', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ pass })
-        });
-        const out = await r.json();
-        if (out.ok) {
-          localStorage.setItem('researchMode', 'true');
-          alert('🔬 Research Preview ENABLED — geo + camera prompts now active on new clicks');
-        } else {
-          alert('Wrong password');
-        }
-      } catch (e) {
-        alert('Auth check failed');
-      }
-    }
   </script>
 </body>
 </html>`);
 });
 
-// Historical clicks feed for the admin portal on `/`.
-app.get('/api/clicks', async (req, res) => {
+// Historical clicks feed for the admin portal on `/`. Gated behind admin
+// auth because the payloads contain IPs, fingerprints, and enrichment.
+app.get('/api/clicks', adminAuth, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT trap_id, data, created_at FROM clicks ORDER BY created_at DESC LIMIT 100'
@@ -265,17 +310,9 @@ app.get('/api/clicks', async (req, res) => {
   }
 });
 
-// Server-side check of the research password so the real value is never
-// embedded in the HTML of the public bait-generator page.
-app.post('/api/research-auth', (req, res) => {
-  const expected = process.env.RESEARCH_PASS || 'RESEARCH-2026-SHADOW';
-  const provided = req.body && req.body.pass;
-  res.json({ ok: provided === expected });
-});
-
-// CREATE TRAP
-app.post('/api/create-trap', async (req, res) => {
-  const id = Math.random().toString(36).substring(2, 10);
+// CREATE TRAP — admin-only; anyone able to create traps can flood the DB.
+app.post('/api/create-trap', adminAuth, async (req, res) => {
+  const id = crypto.randomBytes(6).toString('hex');
   await pool.query('INSERT INTO traps (id) VALUES ($1)', [id]);
   res.json({ link: `/check-scammer/${id}` });
 });
@@ -353,7 +390,7 @@ app.get('/check-scammer/:id', (req, res) => {
 });
 
 // ROBUST DASHBOARD (full live view of all great information)
-app.get('/dashboard', (req, res) => {
+app.get('/dashboard', adminAuth, (req, res) => {
   res.send(`
 <!DOCTYPE html>
 <html>
@@ -368,10 +405,6 @@ app.get('/dashboard', (req, res) => {
   <div class="max-w-7xl mx-auto p-8">
     <div class="flex justify-between items-center mb-8">
       <h1 class="text-4xl font-bold text-lime-400">Sentinel Trap Live Dashboard</h1>
-      <div>
-        <button onclick="toggleResearch()" class="px-6 py-3 bg-amber-600 hover:bg-amber-700 rounded-xl">🔬 RESEARCH PREVIEW (enter password below)</button>
-        <input id="researchPass" type="password" placeholder="RESEARCH-2026-SHADOW" class="ml-4 bg-zinc-900 px-4 py-3 rounded-xl">
-      </div>
     </div>
 
     <div id="liveLog" class="space-y-6"></div>
@@ -401,30 +434,56 @@ app.get('/dashboard', (req, res) => {
       \`;
       logDiv.prepend(entry);
     });
-
-    function toggleResearch() {
-      const pass = document.getElementById('researchPass').value;
-      if (pass === '${process.env.RESEARCH_PASS || "RESEARCH-2026-SHADOW"}') {
-        localStorage.setItem('researchMode', 'true');
-        alert('🔬 Research Preview ENABLED — geo + camera prompts now active on new clicks');
-      } else {
-        alert('Wrong password');
-      }
-    }
   </script>
 </body>
 </html>`);
 });
 
+// Per-IP rate limits for the public scammer-facing endpoints so they can't
+// be abused to flood the database or socket.io with junk events.
+const trackLimiter = rateLimit({ windowMs: 60_000, max: 30 });
+const liveLimiter = rateLimit({ windowMs: 60_000, max: 30 });
+
+function getClientIp(req) {
+  // `trust proxy` is set, so Express parses `x-forwarded-for` for us and
+  // `req.ip` is the first (client) hop rather than a downstream proxy.
+  return req.ip || req.socket.remoteAddress || null;
+}
+
+async function trapExists(trapId) {
+  if (typeof trapId !== 'string' || !/^[a-zA-Z0-9]{1,64}$/.test(trapId)) return false;
+  try {
+    const r = await pool.query('SELECT 1 FROM traps WHERE id = $1', [trapId]);
+    return r.rowCount > 0;
+  } catch (e) {
+    console.error('trapExists query failed:', e.message);
+    return false;
+  }
+}
+
 // TRACK — runs enrichment (ipinfo / AbuseIPDB / OpenRouter AI), persists to
 // the `clicks` table, and emits `live-click` over socket.io so the admin
-// portal sees the event in real time. All external enrichment is optional:
-// missing API keys just skip that field, they don't fail the request.
-app.post('/api/track', async (req, res) => {
-  try {
-    const body = req.body || {};
-    const clientIp = body.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+// portal sees the event in real time. The response returns immediately and
+// enrichment happens in the background so the bait page can redirect without
+// waiting for up to ~20s of third-party API timeouts. All external
+// enrichment is optional: missing API keys just skip that field.
+app.post('/api/track', trackLimiter, async (req, res) => {
+  const body = req.body || {};
+  const { trapId } = body;
 
+  if (!(await trapExists(trapId))) {
+    return res.status(404).json({ error: 'unknown trap' });
+  }
+
+  // Server-derived only; client-supplied `body.ip` is ignored so it can't be
+  // used to poison enrichment / stored records.
+  const clientIp = getClientIp(req);
+
+  // Acknowledge immediately so the client can redirect without blocking on
+  // external API timeouts.
+  res.json({ ok: true });
+
+  setImmediate(async () => {
     let ipinfo = null, abuse = null, aiProfile = null;
 
     if (process.env.IPINFO_TOKEN && clientIp) {
@@ -472,36 +531,52 @@ app.post('/api/track', async (req, res) => {
       } catch (e) { console.error('openrouter failed:', e.message); }
     }
 
-    const enriched = Object.assign({}, body, { ip: clientIp, ipinfo, abuse, aiProfile });
+    // Strip client-supplied ip so it can't override the server-derived value.
+    const { ip: _ignored, ...safeBody } = body;
+    const enriched = Object.assign({}, safeBody, { ip: clientIp, ipinfo, abuse, aiProfile });
 
-    if (body.trapId) {
-      try {
-        await pool.query('INSERT INTO clicks (trap_id, data) VALUES ($1, $2)', [body.trapId, enriched]);
-      } catch (e) { console.error('clicks insert failed:', e.message); }
-    }
+    try {
+      await pool.query('INSERT INTO clicks (trap_id, data) VALUES ($1, $2)', [trapId, enriched]);
+    } catch (e) { console.error('clicks insert failed:', e.message); }
 
     io.emit('live-click', enriched);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('track failed:', e);
-    res.status(500).json({ error: 'track failed' });
-  }
+  });
 });
 
-// RESEARCH LIVE — geolocation / extra signals from the scammer after the
-// research-mode toggle. Persist to `live_events` and emit `research-live`
-// so the admin portal can show it alongside the click feed.
-app.post('/api/live', async (req, res) => {
-  const payload = Object.assign({}, req.body || {}, { receivedAt: new Date().toISOString() });
+// RESEARCH LIVE — geolocation / extra signals captured from the scammer.
+// Requires a valid `trapId` (anti-spam), whitelists the accepted fields, and
+// is rate-limited per IP. Persists to `live_events` and emits
+// `research-live` so the admin portal can show it alongside the click feed.
+app.post('/api/live', liveLimiter, async (req, res) => {
+  const body = req.body || {};
+  const { trapId } = body;
+
+  if (!(await trapExists(trapId))) {
+    return res.status(404).json({ error: 'unknown trap' });
+  }
+
+  const numericFields = ['latitude', 'longitude', 'accuracy', 'altitude', 'heading', 'speed', 'timestamp'];
+  const clean = { trapId };
+  for (const k of numericFields) {
+    if (body[k] === undefined || body[k] === null) continue;
+    const v = Number(body[k]);
+    if (!Number.isFinite(v)) {
+      return res.status(400).json({ error: `invalid ${k}` });
+    }
+    clean[k] = v;
+  }
+  clean.receivedAt = new Date().toISOString();
+
   try {
-    await pool.query('INSERT INTO live_events (data) VALUES ($1)', [payload]);
+    await pool.query('INSERT INTO live_events (data) VALUES ($1)', [clean]);
   } catch (e) { console.error('live insert failed:', e.message); }
-  io.emit('research-live', payload);
+  io.emit('research-live', clean);
   res.sendStatus(200);
 });
 
-// Historical research-mode events for the admin portal.
-app.get('/api/live-events', async (req, res) => {
+// Historical research-mode events for the admin portal. Gated behind admin
+// auth because the payloads include precise geolocation.
+app.get('/api/live-events', adminAuth, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT data, created_at FROM live_events ORDER BY created_at DESC LIMIT 100'
