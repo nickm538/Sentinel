@@ -34,7 +34,7 @@ username, password = `ADMIN_PASS`). The public bait URL is
 | `IPINFO_TOKEN` | optional | [ipinfo.io](https://ipinfo.io) token — country / ASN / org lookup. |
 | `ABUSEIPDB_KEY` | optional | [AbuseIPDB](https://www.abuseipdb.com) key — abuse confidence score. |
 | `OPENROUTER_KEY` | optional | [OpenRouter](https://openrouter.ai) key — AI scammer profile. |
-| `OPENROUTER_MODEL` | optional | Model slug for OpenRouter. Defaults to `openai/gpt-4o-mini`. |
+| `OPENROUTER_MODEL` | optional | Model slug for OpenRouter. Defaults to `openai/gpt-5-mini`. |
 | `PORT` | managed | Injected by Railway. Falls back to `3000` locally. |
 
 Missing optional keys just skip that enrichment field — clicks are still
