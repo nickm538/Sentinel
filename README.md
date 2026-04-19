@@ -8,7 +8,7 @@ time (IP / ASN / abuse score / AI profile / optional geolocation).
 
 ```bash
 npm install
-cp .env.example .env   # fill in at least DATABASE_URL, ADMIN_PASS, ALLOWED_ORIGINS
+cp .env.example .env   # fill in at least DATABASE_URL and ADMIN_PASS
 npm start              # -> http://localhost:3000
 ```
 
@@ -30,7 +30,7 @@ username, password = `ADMIN_PASS`). The public bait URL is
 | --- | --- | --- |
 | `DATABASE_URL` | ✅ | Postgres connection string. On Railway, use `${{ Postgres.DATABASE_URL }}`. |
 | `ADMIN_PASS` | ✅ | Password for the admin portal (Basic auth). Server fails closed (503) if unset. |
-| `ALLOWED_ORIGINS` | ✅ | Comma-separated CORS / socket.io allow-list, e.g. `https://your-app.up.railway.app`. |
+| `ALLOWED_ORIGINS` | recommended | Comma-separated CORS / socket.io allow-list, e.g. `https://your-app.up.railway.app`. Only needed if the frontend is served from a different origin than the backend; if unset, cross-origin requests are rejected but same-origin still works. |
 | `IPINFO_TOKEN` | optional | [ipinfo.io](https://ipinfo.io) token — country / ASN / org lookup. |
 | `ABUSEIPDB_KEY` | optional | [AbuseIPDB](https://www.abuseipdb.com) key — abuse confidence score. |
 | `OPENROUTER_KEY` | optional | [OpenRouter](https://openrouter.ai) key — AI scammer profile. |
