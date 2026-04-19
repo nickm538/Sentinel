@@ -51,6 +51,7 @@ app.get('/', (req, res) => {
     <div id="generator">
       <p class="text-xl mb-8">Generate a fresh casual scammer bait link instantly.</p>
       <button onclick="generateBait()" class="w-full py-6 text-2xl bg-red-600 hover:bg-red-700 rounded-xl font-bold">GENERATE NEW BAIT LINK</button>
+      <button onclick="openAdminPortal()" class="mt-4 w-full py-4 text-lg bg-zinc-800 hover:bg-zinc-700 rounded-xl font-bold text-lime-400">OPEN ADMIN PORTAL (view results &amp; secret session)</button>
     </div>
 
     <!-- ADMIN PORTAL — revealed after the red button is pressed -->
