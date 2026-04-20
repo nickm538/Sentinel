@@ -899,44 +899,80 @@ app.post('/api/track', trackLimiter, async (req, res) => {
 
       if (process.env.OPENROUTER_KEY) {
         console.log('🤖 Requesting AI profile from OpenRouter...');
-        try {
-          const summary = {
-            ip: clientIp, ua: body.ua, ipinfo, abuse, hostnames,
-            timezone: body.timezone, languages: body.languages, screen: body.screen,
-            // Research-mode signals — always included so the AI can attempt
-            // a best-effort probabilistic identity / location / carrier guess.
-            research: body.research || null
-          };
-          const r = await axios.post(
-            'https://openrouter.ai/api/v1/chat/completions',
-            {
-              model: process.env.OPENROUTER_MODEL || 'openai/gpt-5-2025-08-07',
-              reasoning_effort: 'high',
-              messages: [{
-                role: 'user',
-                content:
-                  'You are profiling a likely-scammer click for a defensive anti-scam ' +
-                  'tool. Using ONLY the structured signals below, give a concise ' +
-                  'probabilistic profile. Where the data supports it, include best-' +
-                  'guess hypotheses (clearly hedged with confidence words like ' +
-                  '"likely" / "possibly") for: approximate location (city / region / ' +
-                  'postal area), likely ISP or mobile carrier, device class (mobile ' +
-                  'vs desktop), whether they are likely behind a VPN/proxy/Tor (note ' +
-                  'any WebRTC IP leak vs reported IP), and a one-line behavioural ' +
-                  'summary. Do NOT invent names, phone numbers, street addresses, or ' +
-                  'any specific personal identifiers that are not derivable from the ' +
-                  'data. Keep it under ~8 short bullet points.\n\n' +
-                  JSON.stringify(summary)
-              }]
+        const summary = {
+          ip: clientIp, ua: body.ua, ipinfo, abuse, hostnames,
+          timezone: body.timezone, languages: body.languages, screen: body.screen,
+          // Research-mode signals — always included so the AI can attempt
+          // a best-effort probabilistic identity / location / carrier guess.
+          research: body.research || null
+        };
+        const promptContent =
+          'You are profiling a likely-scammer click for a defensive anti-scam ' +
+          'tool. Using ONLY the structured signals below, give a concise ' +
+          'probabilistic profile. Where the data supports it, include best-' +
+          'guess hypotheses (clearly hedged with confidence words like ' +
+          '"likely" / "possibly") for: approximate location (city / region / ' +
+          'postal area), likely ISP or mobile carrier, device class (mobile ' +
+          'vs desktop), whether they are likely behind a VPN/proxy/Tor (note ' +
+          'any WebRTC IP leak vs reported IP), and a one-line behavioural ' +
+          'summary. Do NOT invent names, phone numbers, street addresses, or ' +
+          'any specific personal identifiers that are not derivable from the ' +
+          'data. Keep it under ~8 short bullet points.\n\n' +
+          JSON.stringify(summary);
+
+        // OpenRouter's canonical reasoning parameter is `reasoning: { effort }`.
+        // The top-level `reasoning_effort` is an OpenAI-only field that
+        // OpenRouter rejects with HTTP 400 on many models. Some models also
+        // don't support reasoning at all — if the request 400s with reasoning
+        // attached, retry once without it so non-reasoning models still work.
+        const baseReq = {
+          model: process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini',
+          messages: [{ role: 'user', content: promptContent }]
+        };
+        const callOR = (extra) => axios.post(
+          'https://openrouter.ai/api/v1/chat/completions',
+          Object.assign({}, baseReq, extra),
+          {
+            headers: {
+              Authorization: `Bearer ${process.env.OPENROUTER_KEY}`,
+              'Content-Type': 'application/json',
+              // OpenRouter recommends these for attribution / rate-limit tier.
+              'HTTP-Referer': process.env.OPENROUTER_REFERER || 'https://github.com/nickm538/Sentinel',
+              'X-Title': 'Sentinel Trap'
             },
-            {
-              headers: { Authorization: `Bearer ${process.env.OPENROUTER_KEY}` },
-              timeout: 15000
-            }
+            timeout: 15000
+          }
+        );
+
+        const logOrError = (label, e) => {
+          const status = e && e.response && e.response.status;
+          const data = e && e.response && e.response.data;
+          const detail = data ? (typeof data === 'string' ? data : JSON.stringify(data)) : '';
+          console.error(
+            `❌ openrouter ${label}: ${e.message}` +
+            (status ? ` (HTTP ${status})` : '') +
+            (detail ? ` — ${detail}` : '')
           );
+        };
+
+        try {
+          let r;
+          try {
+            r = await callOR({ reasoning: { effort: 'high' } });
+          } catch (e1) {
+            const status = e1 && e1.response && e1.response.status;
+            if (status === 400) {
+              logOrError('first attempt 400, retrying without reasoning', e1);
+              r = await callOR({});
+            } else {
+              throw e1;
+            }
+          }
           aiProfile = r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content;
           console.log(`✅ AI profile generated (${aiProfile ? aiProfile.length : 0} chars)`);
-        } catch (e) { console.error('❌ openrouter failed:', e.message); }
+        } catch (e) {
+          logOrError('failed', e);
+        }
       } else {
         console.log('ℹ️  OpenRouter skipped (no OPENROUTER_KEY)');
       }
