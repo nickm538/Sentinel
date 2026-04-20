@@ -1189,8 +1189,7 @@ app.post('/api/live', liveLimiter, async (req, res) => {
 // Apify proxy — admin-gated surface of the three relevant Apify v2 endpoints
 // so the portal (or a human operator) can inspect a resurrected deep-web
 // search run without exposing APIFY_TOKEN to the browser. The token stays
-// server-side; the admin just provides the runId, which defaults to
-// APIFY_ACTOR_RUN_ID.
+// server-side; the admin must provide the runId in the route path.
 //
 //   GET /api/apify-run/:runId            → run metadata (status, finishedAt, ...)
 //   GET /api/apify-run/:runId/input      → last INPUT the actor ran with
