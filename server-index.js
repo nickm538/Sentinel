@@ -599,7 +599,7 @@ app.get('/dashboard', adminLimiter, adminAuth, (req, res) => {
     });
   </script>
 </body>
-</html>\`);
+</html>`);
 });
 
 
