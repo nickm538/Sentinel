@@ -599,7 +599,7 @@ app.get('/dashboard', adminLimiter, adminAuth, (req, res) => {
     });
   </script>
 </body>
-</html>\`);
+</html>`);
 });
 
 
@@ -760,6 +760,27 @@ app.post('/api/live', liveLimiter, async (req, res) => {
   } catch (e) { console.error('live insert failed:', e.message); }
   io.emit('research-live', clean);
   res.sendStatus(200);
+});
+
+// Historical clicks for the admin portal. Gated behind admin auth because the
+// payloads include IPs, fingerprints, and enrichment data.
+app.get('/api/clicks', adminLimiter, adminAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT trap_id, data, created_at FROM clicks ORDER BY created_at DESC LIMIT 100'
+    );
+    // Include trap_id inside the data blob so the existing renderer (which
+    // reads `data.trapId`) keeps working even for rows where the client
+    // payload didn't echo it back.
+    const rows = result.rows.map(r => ({
+      data: Object.assign({}, r.data || {}, { trapId: r.trap_id }),
+      created_at: r.created_at,
+    }));
+    res.json(rows);
+  } catch (e) {
+    console.error('clicks query failed:', e.message);
+    res.status(500).json({ error: 'failed to load clicks' });
+  }
 });
 
 // Historical research-mode events for the admin portal. Gated behind admin
