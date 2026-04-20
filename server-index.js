@@ -6,6 +6,37 @@ const axios = require('axios');
 const cors = require('cors');
 const crypto = require('crypto');
 const dns = require('dns').promises;
+const net = require('net');
+
+// Guard the PTR lookup: skip private/loopback/link-local IPs (no useful PTR
+// and often cause resolver hangs inside private networks) and race against a
+// short timeout so a slow/hung resolver can't stall the whole enrichment.
+const REVERSE_DNS_TIMEOUT_MS = 2000;
+function isPrivateOrInvalidIp(ip) {
+  const fam = net.isIP(ip);
+  if (!fam) return true;
+  if (fam === 4) {
+    const p = ip.split('.').map(Number);
+    if (p[0] === 10) return true;
+    if (p[0] === 127) return true;
+    if (p[0] === 169 && p[1] === 254) return true;
+    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+    if (p[0] === 192 && p[1] === 168) return true;
+    if (p[0] === 0) return true;
+    return false;
+  }
+  // IPv6: loopback, link-local, unique-local
+  const lower = ip.toLowerCase();
+  if (lower === '::1' || lower === '::') return true;
+  if (lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd')) return true;
+  return false;
+}
+async function reverseDnsWithTimeout(ip, timeoutMs = REVERSE_DNS_TIMEOUT_MS) {
+  return Promise.race([
+    dns.reverse(ip),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('reverse-dns timeout')), timeoutMs))
+  ]);
+}
 
 const app = express();
 
@@ -912,12 +943,14 @@ app.post('/api/track', trackLimiter, async (req, res) => {
 
       // Reverse-DNS — cheap, no API key, sometimes leaks ISP customer
       // hostname like `c-73-x-x-x.hsd1.wa.comcast.net` which gives a
-      // coarse geographic + carrier hint.
-      if (clientIp) {
+      // coarse geographic + carrier hint. Skip private/invalid addresses
+      // (no useful PTR) and race against a short timeout so a slow/hung
+      // resolver can't stall the background enrichment task.
+      if (clientIp && !isPrivateOrInvalidIp(clientIp)) {
         try {
-          hostnames = await dns.reverse(clientIp);
+          hostnames = await reverseDnsWithTimeout(clientIp);
           console.log(`🔎 Reverse DNS: ${hostnames.join(', ')}`);
-        } catch (e) { /* common: no PTR record */ }
+        } catch (e) { /* common: no PTR record, or timeout */ }
       }
 
       if (process.env.IPINFO_TOKEN && clientIp) {
