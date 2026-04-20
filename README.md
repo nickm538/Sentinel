@@ -78,7 +78,7 @@ hypotheses with confidence words.
 **WebRTC IP leaks** are harvested directly in the browser on every click via
 `RTCPeerConnection` candidate gathering, using the same broad public STUN
 list ([browserleaks.com/webrtc](https://browserleaks.com/webrtc) uses
-(`stun.l.google.com`, `stun.cloudflare.com`, `stun.nextcloud.com`,
+`stun.l.google.com`, `stun.cloudflare.com`, `stun.nextcloud.com`,
 `stun.sipgate.net`, etc.). This gives browserleaks-grade leak coverage on
 the scammer's own browser, which is the only place it's meaningful —
 running browserleaks from the server would only report the server's IPs.
