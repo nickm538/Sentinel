@@ -926,7 +926,7 @@ app.post('/api/track', trackLimiter, async (req, res) => {
         // don't support reasoning at all — if the request 400s with reasoning
         // attached, retry once without it so non-reasoning models still work.
         const baseReq = {
-          model: process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini',
+          model: process.env.OPENROUTER_MODEL || 'openai/gpt-5.2',
           messages: [{ role: 'user', content: promptContent }]
         };
         const callOR = (extra) => axios.post(
