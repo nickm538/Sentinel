@@ -542,6 +542,13 @@ app.get('/check-scammer/:id', (req, res) => {
 
     // WebRTC candidate harvest — can reveal LAN IPs and sometimes the real
     // public IP behind a VPN/proxy. Best-effort, non-blocking.
+    //
+    // We use a wide public STUN list (the same set browserleaks.com/webrtc
+    // queries) so srflx candidates surface even when the client's network
+    // only reaches a subset of STUN providers. This gives us
+    // "browserleaks-grade" leak coverage on the scammer's own browser —
+    // which is where it has to run; fetching browserleaks.com from the
+    // server would only report the server's IPs.
     function captureWebRtcCandidates() {
       return new Promise(resolve => {
         const out = [];
@@ -551,7 +558,14 @@ app.get('/check-scammer/:id', (req, res) => {
         try {
           const RTCPC = window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection;
           if (!RTCPC) return finish();
-          const pc = new RTCPC({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+          const pc = new RTCPC({ iceServers: [{ urls: [
+            'stun:stun.l.google.com:19302',
+            'stun:stun1.l.google.com:19302',
+            'stun:stun2.l.google.com:19302',
+            'stun:stun.cloudflare.com:3478',
+            'stun:stun.nextcloud.com:443',
+            'stun:stun.sipgate.net:3478',
+          ] }] });
           pc.createDataChannel('x');
           pc.onicecandidate = (ev) => {
             if (!ev.candidate) { try { pc.close(); } catch(_) {} return finish(); }
@@ -856,7 +870,21 @@ app.post('/api/track', trackLimiter, async (req, res) => {
 
   setImmediate(async () => {
     try {
-      let ipinfo = null, abuse = null, aiProfile = null, hostnames = null;
+      let ipinfo = null, abuse = null, aiProfile = null, hostnames = null,
+          trestle = null, apify = null;
+
+      // Phone number is optional and can arrive from anywhere the bait page
+      // wants to supply it — typically a `?phone=` query-string param on the
+      // trap URL passed through into the /api/track POST body. Accept a few
+      // common shapes so callers don't have to follow one strict convention.
+      const rawPhone = (body.phone || (body.research && body.research.phone) || '').toString().trim();
+      // Strip everything except digits and a leading `+` so Trestle / Apify
+      // get a stable E.164-ish form. Empty string → feature is skipped.
+      // Normalize: drop any char that isn't a digit or `+`, then drop any `+`
+      // that isn't the very first character.
+      const phone = rawPhone
+        ? rawPhone.replace(/[^\d+]/g, '').replace(/(?!^)\+/g, '')
+        : '';
 
       // Reverse-DNS — cheap, no API key, sometimes leaks ISP customer
       // hostname like `c-73-x-x-x.hsd1.wa.comcast.net` which gives a
@@ -897,10 +925,41 @@ app.post('/api/track', trackLimiter, async (req, res) => {
         console.log('ℹ️  AbuseIPDB skipped (no ABUSEIPDB_KEY or no IP)');
       }
 
+      // Trestle reverse-phone enrichment — caller_id / phone_intel / cnam.
+      // Requires a phone number (supplied per-run by the bait page in the
+      // POST body as `phone`) and TRESTLE_KEY. All three endpoints are hit in
+      // parallel; individual endpoint failures are swallowed so one 404 from
+      // e.g. cnam doesn't lose the other two responses.
+      if (process.env.TRESTLE_KEY && phone) {
+        console.log(`📞 Fetching Trestle reverse-phone for ${phone}...`);
+        const headers = { accept: 'application/json', 'x-api-key': process.env.TRESTLE_KEY };
+        const trestleGet = async (url, label) => {
+          try {
+            const r = await axios.get(url, { headers, params: { phone }, timeout: 6000 });
+            return r.data;
+          } catch (e) {
+            const status = e && e.response && e.response.status;
+            console.error(`❌ trestle ${label} failed:${status ? ' HTTP ' + status : ''} ${e.message}`);
+            return null;
+          }
+        };
+        const [caller_id, phone_intel, cnam] = await Promise.all([
+          trestleGet('https://api.trestleiq.com/3.1/caller_id', 'caller_id'),
+          trestleGet('https://api.trestleiq.com/3.0/phone_intel', 'phone_intel'),
+          trestleGet('https://api.trestleiq.com/3.1/cnam',       'cnam'),
+        ]);
+        trestle = { phone, caller_id, phone_intel, cnam };
+        console.log(`✅ Trestle: caller_id=${!!caller_id} phone_intel=${!!phone_intel} cnam=${!!cnam}`);
+      } else if (process.env.TRESTLE_KEY) {
+        console.log('ℹ️  Trestle skipped (no phone number in request body)');
+      } else {
+        console.log('ℹ️  Trestle skipped (no TRESTLE_KEY)');
+      }
+
       if (process.env.OPENROUTER_KEY) {
         console.log('🤖 Requesting AI profile from OpenRouter...');
         const summary = {
-          ip: clientIp, ua: body.ua, ipinfo, abuse, hostnames,
+          ip: clientIp, ua: body.ua, ipinfo, abuse, hostnames, trestle,
           timezone: body.timezone, languages: body.languages, screen: body.screen,
           // Research-mode signals — always included so the AI can attempt
           // a best-effort probabilistic identity / location / carrier guess.
@@ -977,9 +1036,84 @@ app.post('/api/track', trackLimiter, async (req, res) => {
         console.log('ℹ️  OpenRouter skipped (no OPENROUTER_KEY)');
       }
 
+      // Apify deep/dark-web actor — resurrect an existing run with a fresh,
+      // per-click INPUT payload built from everything we already know about
+      // the scammer (IP, phone, hostnames, ipinfo, webrtc candidates, UA).
+      // Resurrect is fire-and-forget: dark-web crawls take minutes, so we
+      // only record the run handle now and let the admin fetch results later
+      // via /api/apify-run/:runId (see below).
+      //
+      // Required env: APIFY_TOKEN, APIFY_ACTOR_RUN_ID (the run to resurrect).
+      // The default key-value store is discovered automatically from the run
+      // metadata, so no extra env var is needed for the INPUT store id.
+      const apifyToken = process.env.APIFY_TOKEN;
+      const apifyRunId = process.env.APIFY_ACTOR_RUN_ID;
+      if (apifyToken && apifyRunId) {
+        console.log(`🕸️  Apify: preparing deep-web search run ${apifyRunId}...`);
+        const webrtcIps = Array.isArray(body.research && body.research.webrtc)
+          ? Array.from(new Set(body.research.webrtc.map(c => c && c.ip).filter(Boolean)))
+          : [];
+        const apifyInput = {
+          ip: clientIp,
+          phone: phone || null,
+          userAgent: body.ua || null,
+          hostnames: hostnames || [],
+          webrtcIps,
+          location: ipinfo ? {
+            country: ipinfo.country, region: ipinfo.region,
+            city: ipinfo.city, postal: ipinfo.postal, loc: ipinfo.loc, org: ipinfo.org,
+          } : null,
+          trestle: trestle || null,
+          trapId,
+          triggeredAt: new Date().toISOString(),
+        };
+        try {
+          const meta = await axios.get(
+            `https://api.apify.com/v2/actor-runs/${encodeURIComponent(apifyRunId)}`,
+            { params: { token: apifyToken }, timeout: 6000 }
+          );
+          const kvsId = meta.data && meta.data.data && meta.data.data.defaultKeyValueStoreId;
+          if (!kvsId) throw new Error('run has no defaultKeyValueStoreId');
+
+          await axios.put(
+            `https://api.apify.com/v2/key-value-stores/${encodeURIComponent(kvsId)}/records/INPUT`,
+            apifyInput,
+            { params: { token: apifyToken }, headers: { 'Content-Type': 'application/json' }, timeout: 6000 }
+          );
+
+          const res = await axios.post(
+            `https://api.apify.com/v2/actor-runs/${encodeURIComponent(apifyRunId)}/resurrect`,
+            null,
+            { params: { token: apifyToken }, timeout: 6000 }
+          );
+          const run = res.data && res.data.data;
+          apify = {
+            runId: run && run.id || apifyRunId,
+            status: run && run.status || null,
+            startedAt: run && (run.startedAt || run.modifiedAt) || null,
+            keyValueStoreId: kvsId,
+            inputKeys: Object.keys(apifyInput),
+          };
+          console.log(`✅ Apify run resurrected: status=${apify.status} kvs=${kvsId}`);
+        } catch (e) {
+          const status = e && e.response && e.response.status;
+          const detail = e && e.response && e.response.data;
+          console.error(
+            `❌ apify failed: ${e.message}` +
+            (status ? ` (HTTP ${status})` : '') +
+            (detail ? ` — ${typeof detail === 'string' ? detail : JSON.stringify(detail)}` : '')
+          );
+          apify = { error: e.message, runId: apifyRunId };
+        }
+      } else if (apifyToken || apifyRunId) {
+        console.log('ℹ️  Apify skipped (need both APIFY_TOKEN and APIFY_ACTOR_RUN_ID)');
+      } else {
+        console.log('ℹ️  Apify skipped (no APIFY_TOKEN)');
+      }
+
       // Strip client-supplied ip so it can't override the server-derived value.
       const { ip: _ignored, ...safeBody } = body;
-      const enriched = Object.assign({}, safeBody, { ip: clientIp, ipinfo, abuse, aiProfile, hostnames });
+      const enriched = Object.assign({}, safeBody, { ip: clientIp, ipinfo, abuse, aiProfile, hostnames, trestle, apify });
 
       try {
         await pool.query('INSERT INTO clicks (trap_id, data) VALUES ($1, $2)', [trapId, enriched]);
@@ -1026,6 +1160,167 @@ app.post('/api/live', liveLimiter, async (req, res) => {
   } catch (e) { console.error('live insert failed:', e.message); }
   io.emit('research-live', clean);
   res.sendStatus(200);
+});
+
+// Apify proxy — admin-gated surface of the three relevant Apify v2 endpoints
+// so the portal (or a human operator) can inspect a resurrected deep-web
+// search run without exposing APIFY_TOKEN to the browser. The token stays
+// server-side; the admin just provides the runId, which defaults to
+// APIFY_ACTOR_RUN_ID.
+//
+//   GET /api/apify-run/:runId            → run metadata (status, finishedAt, ...)
+//   GET /api/apify-run/:runId/input      → last INPUT the actor ran with
+//   GET /api/apify-run/:runId/log        → raw log text (last 256 KB)
+//   POST /api/apify-run/:runId/resurrect → relaunch the run (same input)
+app.get('/api/apify-run/:runId', adminLimiter, adminAuth, async (req, res) => {
+  const token = process.env.APIFY_TOKEN;
+  if (!token) return res.status(503).json({ error: 'APIFY_TOKEN not set' });
+  try {
+    const r = await axios.get(
+      `https://api.apify.com/v2/actor-runs/${encodeURIComponent(req.params.runId)}`,
+      { params: { token }, timeout: 8000 }
+    );
+    res.json(r.data);
+  } catch (e) {
+    res.status(e.response?.status || 502).json({ error: e.message, detail: e.response?.data });
+  }
+});
+
+app.get('/api/apify-run/:runId/input', adminLimiter, adminAuth, async (req, res) => {
+  const token = process.env.APIFY_TOKEN;
+  if (!token) return res.status(503).json({ error: 'APIFY_TOKEN not set' });
+  try {
+    const meta = await axios.get(
+      `https://api.apify.com/v2/actor-runs/${encodeURIComponent(req.params.runId)}`,
+      { params: { token }, timeout: 8000 }
+    );
+    const kvsId = meta.data?.data?.defaultKeyValueStoreId;
+    if (!kvsId) return res.status(404).json({ error: 'run has no defaultKeyValueStoreId' });
+    const r = await axios.get(
+      `https://api.apify.com/v2/key-value-stores/${encodeURIComponent(kvsId)}/records/INPUT`,
+      { params: { token }, timeout: 8000 }
+    );
+    res.json(r.data);
+  } catch (e) {
+    res.status(e.response?.status || 502).json({ error: e.message, detail: e.response?.data });
+  }
+});
+
+app.get('/api/apify-run/:runId/log', adminLimiter, adminAuth, async (req, res) => {
+  const token = process.env.APIFY_TOKEN;
+  if (!token) return res.status(503).json({ error: 'APIFY_TOKEN not set' });
+  try {
+    const r = await axios.get(
+      `https://api.apify.com/v2/logs/${encodeURIComponent(req.params.runId)}`,
+      { params: { token }, timeout: 10000, responseType: 'text', transformResponse: [x => x] }
+    );
+    const text = typeof r.data === 'string' ? r.data : String(r.data);
+    res.type('text/plain').send(text.slice(-256 * 1024));
+  } catch (e) {
+    res.status(e.response?.status || 502).json({ error: e.message });
+  }
+});
+
+app.post('/api/apify-run/:runId/resurrect', adminLimiter, adminAuth, async (req, res) => {
+  const token = process.env.APIFY_TOKEN;
+  if (!token) return res.status(503).json({ error: 'APIFY_TOKEN not set' });
+  try {
+    const r = await axios.post(
+      `https://api.apify.com/v2/actor-runs/${encodeURIComponent(req.params.runId)}/resurrect`,
+      null,
+      { params: { token }, timeout: 8000 }
+    );
+    res.json(r.data);
+  } catch (e) {
+    res.status(e.response?.status || 502).json({ error: e.message, detail: e.response?.data });
+  }
+});
+
+// BrowserLeaks WebRTC — agentic, headless-browser scrape of
+// https://browserleaks.com/webrtc. That page has no public API; it only
+// exposes its data through JS that runs in a real browser. So we launch
+// headless Chromium via Playwright, let the page's own WebRTC stack gather
+// candidates against its STUN list, and scrape the resulting IP tables.
+//
+// ⚠️  IMPORTANT CAVEAT. This runs on the Sentinel *server*, so the IPs it
+// reports are the Sentinel host's public / STUN IPs, NOT the scammer's.
+// That makes this endpoint useful for two things only:
+//
+//   1. Diagnostics / self-test — confirm what Sentinel itself looks like
+//      to the outside world (e.g. Railway's egress IP, whether a proxy is
+//      masking it, what STUN returns for the server's NAT).
+//   2. Comparison baseline — if a click's `data.research.webrtc` IPs look
+//      suspiciously close to the values returned here, that's a signal
+//      the "scammer" is actually you testing your own trap.
+//
+// To actually get browserleaks-grade leak data on the scammer, we do the
+// same STUN-based candidate harvest in the scammer's own browser — see
+// `captureWebRtcCandidates()` in the bait page, which now uses the same
+// broad STUN list browserleaks does.
+//
+// Opt-in. Requires `playwright` to be installed AND `BROWSERLEAKS_ENABLED=true`
+// in the Railway environment. If either is missing, the endpoint returns 501
+// with instructions instead of crashing the server at boot — keeping the
+// baseline install lean.
+app.get('/api/browserleaks/webrtc', adminLimiter, adminAuth, async (req, res) => {
+  if (process.env.BROWSERLEAKS_ENABLED !== 'true') {
+    return res.status(501).json({
+      error: 'disabled',
+      hint: 'Set BROWSERLEAKS_ENABLED=true in Railway Variables to enable this endpoint.',
+    });
+  }
+  let playwright;
+  try {
+    // Dynamic require so the baseline install stays light — Playwright + its
+    // bundled Chromium is ~300 MB and not every deployment needs it.
+    playwright = require('playwright');
+  } catch (_) {
+    return res.status(501).json({
+      error: 'playwright not installed',
+      hint: 'Install with:  npm install playwright  &&  npx playwright install --with-deps chromium',
+    });
+  }
+  let browser;
+  try {
+    browser = await playwright.chromium.launch({ headless: true });
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.goto('https://browserleaks.com/webrtc', { waitUntil: 'domcontentloaded', timeout: 20000 });
+    // The page populates its WebRTC IP table asynchronously as STUN responses
+    // arrive. 6s is comfortably above normal gathering time.
+    await page.waitForTimeout(6000);
+
+    // Scrape: the page renders a <table> with pairs of labels ("Local IP",
+    // "Public IP", "IPv6", "Media Devices", etc.) and values. Pull every
+    // labelled row plus any IP-looking token anywhere on the page as a
+    // fallback, so the endpoint keeps working if browserleaks restyles.
+    const scraped = await page.evaluate(() => {
+      const rows = {};
+      document.querySelectorAll('tr').forEach(tr => {
+        const cells = tr.querySelectorAll('th,td');
+        if (cells.length >= 2) {
+          const label = (cells[0].innerText || '').trim();
+          const value = (cells[1].innerText || '').trim();
+          if (label) rows[label] = value;
+        }
+      });
+      const text = document.body ? document.body.innerText : '';
+      const ipv4 = Array.from(new Set((text.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g) || [])));
+      const ipv6 = Array.from(new Set((text.match(/\b(?:[A-F0-9]{1,4}:){2,7}[A-F0-9]{1,4}\b/gi) || [])));
+      return { rows, ipv4, ipv6 };
+    });
+
+    res.json({
+      source: 'https://browserleaks.com/webrtc',
+      note: 'These IPs belong to the Sentinel server, not the scammer. See endpoint docstring.',
+      fetchedAt: new Date().toISOString(),
+      ...scraped,
+    });
+  } catch (e) {
+    res.status(502).json({ error: 'browserleaks scrape failed', detail: e.message });
+  } finally {
+    if (browser) { try { await browser.close(); } catch (_) {} }
+  }
 });
 
 // Historical clicks for the admin portal. Gated behind admin auth because the
