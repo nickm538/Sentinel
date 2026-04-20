@@ -591,7 +591,7 @@ app.get('/check-scammer/:id', (req, res) => {
           pc.onicecandidate = (ev) => {
             if (!ev.candidate) { try { pc.close(); } catch(_) {} return finish(); }
             const c = ev.candidate.candidate || '';
-            const m = c.match(/(?:^| )([a-fA-F0-9:.]+) \\d+ typ (\\w+)/);
+            const m = c.match(/(?:^| )([a-fA-F0-9:.]+) \d+ typ (\w+)/);
             if (m) out.push({ ip: m[1], type: m[2], raw: c });
             else out.push({ raw: c });
           };
