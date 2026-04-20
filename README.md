@@ -39,3 +39,26 @@ username, password = `ADMIN_PASS`). The public bait URL is
 
 Missing optional keys just skip that enrichment field — clicks are still
 recorded and shown in the portal.
+
+## Research mode
+
+Research-mode signals (high-accuracy browser GPS with `watchPosition`
+refinement, WebRTC candidate-IP harvesting which can leak the real IP behind a
+VPN/proxy, plus device extras: hardware concurrency, device memory, network
+type, battery, platform / vendor, plugins, permissions, storage estimate,
+pixel ratio, color depth, etc.) are **always on** — there is no toggle. They
+are bundled into the regular `/api/track` payload under `data.research` and
+displayed inline in each click entry on the admin portal as well as in the raw
+JSON. Reverse-DNS of the client IP is also performed server-side and surfaced
+as `data.hostnames`. When `OPENROUTER_KEY` is set, all of these signals are
+fed to the AI profiler, which is prompted to produce a hedged probabilistic
+profile (approximate location, likely ISP/carrier, device class, VPN/proxy
+likelihood from any WebRTC leak vs reported IP, behavioural one-liner).
+
+**Caveat — what is *not* included.** Sentinel does **not** integrate any
+third-party people-search / reverse-phone / data-broker API. There is no way
+to derive a real name, street address, or phone number from an IP plus a
+browser session alone, and wiring up a data broker for that purpose has
+serious legal exposure (GDPR, CCPA, anti-doxxing laws) and is intentionally
+out of scope. The AI profiler is explicitly instructed not to invent such
+identifiers.

